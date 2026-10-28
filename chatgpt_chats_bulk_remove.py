@@ -71,7 +71,7 @@ def token_expiry(token):
 
 
 class Api:
-    def __init__(self, auth, delay=1.0, retries=3, retry_delay=2.0):
+    def __init__(self, auth, delay=2.0, retries=4, retry_delay=10.0):
         self.auth = f"Bearer {auth}"
         self.delay, self.retries, self.retry_delay = delay, retries, retry_delay
         self.last = 0.0
@@ -94,6 +94,7 @@ class Api:
                     raise AuthError("HTTP 401: token is expired or not valid. Get a new token.") from None
                 if (e.code != 429 and e.code < 500) or attempt == self.retries:
                     raise
+                # ChatGPT sends no Retry-After today (checked 2026-10). Kept in case Cloudflare or the API add it.
                 retry_after = e.headers.get("Retry-After") or ""
                 wait = float(retry_after) if retry_after.isdigit() else self.retry_delay * 2**attempt
             except OSError as e:  # URLError, timeouts, connection resets
@@ -316,9 +317,9 @@ def parse_args(argv):
     g.add_argument("--output", choices=["table", "json", "ids"], default="table")
     g.add_argument("--verbose", **flag, help="debug log to stderr: requests, retries, token expiry, sources. Traceback on errors.")
     g = p.add_argument_group("execution")
-    g.add_argument("--delay", type=parse_duration, default=1.0, help="min time between requests, e.g. 500ms, 1s (default 1s)")
-    g.add_argument("--retries", type=int, default=3, help="retries on 429, 5xx and network errors")
-    g.add_argument("--retry-delay", type=parse_duration, default=2.0, help="first retry wait, doubles each time (default 2s)")
+    g.add_argument("--delay", type=parse_duration, default=2.0, help="min time between requests, e.g. 500ms, 2s (default 2s)")
+    g.add_argument("--retries", type=int, default=4, help="retries on 429, 5xx and network errors (default 4)")
+    g.add_argument("--retry-delay", type=parse_duration, default=10.0, help="first retry wait, doubles each time (default 10s)")
     g.add_argument("--continue-on-error", **flag)
     a = p.parse_args(argv)
     if a.project_name and a.exclude_project_chats:

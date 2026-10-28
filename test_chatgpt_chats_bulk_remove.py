@@ -202,7 +202,7 @@ class Errors(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=[TimeoutError(), Resp(b"{}")]), \
                 self.assertLogs(m.log, "DEBUG") as logs:
             m.Api("x", delay=0, retry_delay=0).call("GET", "me")
-        self.assertTrue(any("retry 1/3 in 0.0s" in line for line in logs.output))
+        self.assertTrue(any("retry 1/4 in 0.0s" in line for line in logs.output))
         self.assertTrue(any("GET me -> 200" in line for line in logs.output))
 
     def test_token_expiry(self):
