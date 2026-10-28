@@ -17,7 +17,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from itertools import islice
 from datetime import date, datetime, timedelta, timezone
 
 BASE = "https://chatgpt.com/backend-api"
@@ -131,15 +130,14 @@ def list_chats(api, a):
 
     Pages are read only when needed. Each source is newest first, so a merge keeps that order.
     """
-    sources = []
-    if a.archived != "only":
-        sources.append(paged_offset(api, "false"))
-    if a.archived != "exclude":
+    # Excluded sources are not read: nothing from them can be deleted.
+    sources = [paged_offset(api, "false")]
+    if not a.exclude_archived:
         sources.append(paged_offset(api, "true"))
     # The main list does not include all project chats. Read each project too.
     projects = {} if a.exclude_project_chats else list_projects(api)
     for pid, name in projects.items():
-        if (not a.project_name or name in a.project_name) and name not in a.exclude_project_name:
+        if not a.project_name or name in a.project_name:
             sources.append(paged_cursor(api, f"gizmos/{pid}/conversations", cursor=0))
     seen = set()
     for c in heapq.merge(*sources, key=updated, reverse=True):
@@ -152,42 +150,76 @@ def list_chats(api, a):
 
 
 def find_chats(api, a):
-    """Return the first --limit matches, newest update first. Stop reading pages after that."""
-    return list(islice((c for c in list_chats(api, a) if keep(c, a)), a.limit))
+    """Return (to_delete, excluded, stopped), newest update first. excluded is [(chat, reason)].
+
+    Stop reading pages after --limit chats to delete. stopped is True if older chats exist that are not checked.
+    """
+    to_delete, excluded = [], []
+    chats = list_chats(api, a)
+    for c in chats:
+        if not selected(c, a):
+            continue
+        reason = excluded_by(c, a)
+        if reason:
+            excluded.append((c, reason))
+            continue
+        to_delete.append(c)
+        if len(to_delete) == a.limit:
+            try:
+                return to_delete, excluded, next(chats, None) is not None
+            except Exception:  # The list is complete. A failed peek must not abort the run.
+                return to_delete, excluded, True
+    return to_delete, excluded, False
 
 
-def keep(c, a):
+def selected(c, a):
+    """Stage 1, select: time window, project and title. Dropped chats are not listed."""
     created = parse_date(c["create_time"])
     title = (c.get("title") or "").lower()
-    project = c.get("project")
-    in_project = (c.get("gizmo_id") or "").startswith("g-p-")
     return all([
         a.create_time_from is None or created >= a.create_time_from,
         a.create_time_to is None or created <= a.create_time_to,
         a.update_time_from is None or updated(c) >= a.update_time_from,
         a.update_time_to is None or updated(c) <= a.update_time_to,
-        not (a.exclude_pinned and c.get("pinned_time")),
-        not (a.exclude_project_chats and in_project),
-        a.archived == "include" or bool(c.get("is_archived")) == (a.archived == "only"),
-        not a.project_name or project in a.project_name,
-        project not in a.exclude_project_name,
-        # A project with no known name (e.g. shared) can be an excluded one. Keep its chats.
-        not (a.exclude_project_name and in_project and project is None),
+        not a.project_name or c.get("project") in a.project_name,
         not a.title_contains or any(t.lower() in title for t in a.title_contains),
-        not any(t.lower() in title for t in a.exclude_title_contains),
     ])
 
 
-def render(chats, fmt):
+def excluded_by(c, a):
+    """Stage 2, filter: return why the chat is excluded, or None to delete it."""
+    title = (c.get("title") or "").lower()
+    project = c.get("project")
+    in_project = (c.get("gizmo_id") or "").startswith("g-p-")
+    if a.exclude_pinned and c.get("pinned_time"):
+        return "pinned"
+    if a.exclude_project_chats and in_project:
+        return "project chat"
+    if project in a.exclude_project_name:
+        return "excluded project"
+    # A project with no known name (e.g. shared) can be an excluded one. Keep its chats.
+    if a.exclude_project_name and in_project and project is None:
+        return "unknown project"
+    for t in a.exclude_title_contains:
+        if t.lower() in title:
+            return f"title has {t!r}"
+    return None
+
+
+def render(chats, fmt, reasons=None):
+    """reasons: one string per chat. Adds a REASON column to the table."""
     if fmt == "ids":
         return "\n".join(c["id"] for c in chats)
     if fmt == "json":
         return json.dumps([{k: c.get(k) for k in FIELDS} for c in chats], indent=2, ensure_ascii=False)
-    lines = [f"{'ID':36}  {'CREATED':10}  {'UPDATED':10}  {'PA':2}  {'PROJECT':20}  TITLE"]
-    for c in chats:
+    reasons = reasons or [""] * len(chats)
+    w = max(map(len, reasons), default=0)
+    col = lambda r: f"{r:{w}}  " if w else ""
+    lines = [f"{'ID':36}  {'CREATED':10}  {'UPDATED':10}  {'PA':2}  {'PROJECT':20}  {col('REASON')}TITLE"]
+    for c, r in zip(chats, reasons):
         flags = ("P" if c.get("pinned_time") else "-") + ("A" if c.get("is_archived") else "-")
         lines.append(f"{c['id']:36}  {c['create_time'][:10]:10}  {(c.get('update_time') or '')[:10]:10}  {flags}  "
-                     f"{(c.get('project') or '')[:20]:20}  {c.get('title') or ''}")
+                     f"{(c.get('project') or '')[:20]:20}  {col(r)}{c.get('title') or ''}")
     return "\n".join(lines)
 
 
@@ -251,7 +283,7 @@ def parse_args(argv):
     g = p.add_argument_group("chat state")
     g.add_argument("--exclude-pinned", **flag)
     g.add_argument("--exclude-project-chats", **flag)
-    g.add_argument("--archived", choices=["include", "exclude", "only"], default="include")
+    g.add_argument("--exclude-archived", **flag)
     g = p.add_argument_group("projects (exact name as shown in the UI, repeatable)")
     g.add_argument("--project-name", action="append", default=[])
     g.add_argument("--exclude-project-name", action="append", default=[])
@@ -290,10 +322,21 @@ def main(argv=None):
     a = parse_args(argv)
     api = Api(a.authorization, a.delay, a.retries, a.retry_delay, a.verbose)
     try:
-        chats = find_chats(api, a)
+        chats, excluded, stopped = find_chats(api, a)
 
-        print(render(chats, a.output))
-        print(f"{len(chats)} chats match", file=sys.stderr)
+        # Stage 2 result first, so the list to delete is next to the prompt.
+        if excluded:
+            print("Excluded, not deleted:", file=sys.stderr)
+            cs, rs = zip(*excluded)
+            print(render(cs, "table", reasons=rs) + "\n", file=sys.stderr)
+        if a.exclude_archived:
+            print("Archive not read (--exclude-archived).", file=sys.stderr)
+        if a.exclude_project_chats:
+            print("Project chat lists not read (--exclude-project-chats). Only project chats in the main list are shown.", file=sys.stderr)
+        print("To delete:", file=sys.stderr, flush=True)
+        print(render(chats, a.output), flush=True)
+        cutoff = ". Stopped at --limit: older chats not checked" if stopped else ""
+        print(f"{len(chats)} to delete, {len(excluded)} excluded{cutoff}", file=sys.stderr)
 
         if a.dry_run or not chats:
             print("dry run: nothing deleted" if a.dry_run else "nothing to delete", file=sys.stderr)

@@ -2,7 +2,7 @@
 import io
 import os
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -44,8 +44,15 @@ def args(*argv):
 
 
 def select(*argv):
-    a = args(*argv)
-    return sorted(c["id"] for c in m.list_chats(FakeApi(), a) if m.keep(c, a))
+    """Return sorted ids to delete."""
+    to_delete, _, _ = m.find_chats(FakeApi(), args(*argv))
+    return sorted(c["id"] for c in to_delete)
+
+
+def excluded(*argv):
+    """Return {id: reason} of excluded chats."""
+    _, out, _ = m.find_chats(FakeApi(), args(*argv))
+    return {c["id"]: r for c, r in out}
 
 
 class Parsing(unittest.TestCase):
@@ -90,8 +97,7 @@ class Filters(unittest.TestCase):
     def test_state_filters(self):
         self.assertEqual(select("--exclude-pinned"), ["a1", "p1", "p2", "r1"])
         self.assertEqual(select("--exclude-project-chats"), ["a1", "a2", "r1"])
-        self.assertEqual(select("--archived=only"), ["r1"])
-        self.assertEqual(select("--archived=exclude"), ["a1", "a2", "p1", "p2"])
+        self.assertEqual(select("--exclude-archived"), ["a1", "a2", "p1", "p2"])
 
     def test_project_filters(self):
         self.assertEqual(select("--project-name", "Work"), ["p1", "p2"])
@@ -105,13 +111,25 @@ class Filters(unittest.TestCase):
     def test_exclude_project_name_keeps_unknown_projects(self):
         shared = chat("s1", "Shared", gizmo_id="g-p-shared")
         a = args("--exclude-project-name", "Work")
-        self.assertFalse(m.keep({**shared, "project": None}, a))
-        self.assertTrue(m.keep({**shared, "project": None}, args()))
+        self.assertEqual(m.excluded_by({**shared, "project": None}, a), "unknown project")
+        self.assertIsNone(m.excluded_by({**shared, "project": None}, args()))
 
-    def test_exclude_project_chats_skips_project_requests(self):
+    def test_lists_excluded_with_reason(self):
+        self.assertEqual(excluded("--exclude-pinned"), {"a2": "pinned"})
+        self.assertEqual(excluded("--exclude-project-chats"), {"p1": "project chat"})
+        self.assertEqual(excluded("--exclude-title-contains", "only"), {"p2": "title has 'only'"})
+        self.assertEqual(excluded("--exclude-project-name", "Work"), {"p1": "excluded project", "p2": "excluded project"})
+
+    def test_excluded_sources_are_not_read(self):
         api = FakeApi()
-        list(m.list_chats(api, args("--exclude-project-chats")))
-        self.assertFalse(any(p.startswith("gizmos/") for _, p in api.calls))
+        m.find_chats(api, args("--exclude-archived", "--exclude-project-chats"))
+        self.assertFalse(any("is_archived=true" in p or p.startswith("gizmos/") for _, p in api.calls))
+
+    def test_selection_drops_are_not_listed(self):
+        self.assertEqual(excluded("--project-name", "Work", "--update-time-to", "2025-12-31"), {})
+
+    def test_title_contains_selects_silently(self):
+        self.assertEqual(excluded("--title-contains", "plain"), {})
 
 
 class PagedApi(FakeApi):
@@ -130,17 +148,44 @@ class PagedApi(FakeApi):
 class EarlyStop(unittest.TestCase):
     def test_limit_reads_only_needed_pages(self):
         api = PagedApi()
-        self.assertEqual([c["id"] for c in m.find_chats(api, args("--limit", "3"))], ["c0", "c1", "c2"])
+        self.assertEqual([c["id"] for c in m.find_chats(api, args("--limit", "3"))[0]], ["c0", "c1", "c2"])
         self.assertFalse(any("offset=28" in p for _, p in api.calls))
 
     def test_update_time_from_stops_paging(self):
         api = PagedApi()
-        self.assertEqual(len(m.find_chats(api, args("--update-time-from", "2026-09-10"))), 22)
+        self.assertEqual(len(m.find_chats(api, args("--update-time-from", "2026-09-10"))[0]), 22)
         self.assertFalse(any("offset=28" in p for _, p in api.calls))
 
     def test_merges_sources_newest_first(self):
-        times = [m.updated(c) for c in m.find_chats(FakeApi(), args())]
+        times = [m.updated(c) for c in m.find_chats(FakeApi(), args())[0]]
         self.assertEqual(times, sorted(times, reverse=True))
+
+    def test_limit_counts_only_chats_to_delete(self):
+        to_delete, out, stopped = m.find_chats(FakeApi(), args("--exclude-pinned", "--limit", "3"))
+        self.assertEqual((len(to_delete), [c["id"] for c, _ in out], stopped), (3, ["a2"], True))
+
+    def test_not_stopped_when_all_read(self):
+        self.assertFalse(m.find_chats(FakeApi(), args("--limit", "99"))[2])
+        self.assertFalse(m.find_chats(FakeApi(), args("--limit", "5"))[2])
+
+    def dry_run(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(m, "Api", return_value=FakeApi()), redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(m.main(["--authorization", "x", "--dry-run", *argv]), 0)
+        return out.getvalue(), err.getvalue()
+
+    def test_dry_run_output(self):
+        out, err = self.dry_run("--exclude-pinned", "--exclude-title-contains", "only")
+        self.assertIn("REASON", err)
+        self.assertRegex(err, r"a2 .* pinned +Pinned chat")
+        self.assertRegex(err, r"p2 .* title has 'only' +Project only")
+        self.assertIn("3 to delete, 2 excluded\n", err)
+        self.assertNotIn("REASON", out)
+        self.assertNotIn("a2", out)
+
+    def test_dry_run_reports_limit_stop(self):
+        _, err = self.dry_run("--exclude-pinned", "--limit", "1")
+        self.assertIn("Stopped at --limit: older chats not checked", err)
 
 
 class Resp(io.BytesIO):
