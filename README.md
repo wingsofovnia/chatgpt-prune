@@ -1,12 +1,12 @@
 # ChatGPT Chat Bulk Remover
 
-Delete ChatGPT chats in bulk from the command line. Filter by date, project, title, pinned and archived state. One Python file, no dependencies.
+Delete ChatGPT chats in bulk from the command line. Filter by date, project, title, pinned and archived state. One Python file.
 
 **Delete is permanent.** You cannot restore a deleted chat. Run with `--dry-run` first.
 
 ## Prerequisites
 
-- [uv](https://docs.astral.sh/uv/), or Python 3.11+.
+- [uv](https://docs.astral.sh/uv/). It installs Python and the dependencies on the first run.
 
 ## Access Token
 
@@ -60,7 +60,7 @@ Important behavior:
 ## Tests
 
 ```sh
-python3 -m unittest -v
+./test_chatgpt_chats_bulk_remove.py -v
 ```
 
 The tests use a fake API. They make no network calls.

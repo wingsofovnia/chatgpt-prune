@@ -1,11 +1,18 @@
-"""Tests with a fake API. No network. Run: python3 -m unittest -v"""
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["rich>=13"]  # Keep in sync with chatgpt_chats_bulk_remove.py.
+# ///
+"""Tests with a fake API. No network. Run: ./test_chatgpt_chats_bulk_remove.py -v"""
 import base64
 import io
 import os
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from unittest import mock
+
+from rich.console import Console
 
 import chatgpt_chats_bulk_remove as m
 
@@ -22,6 +29,8 @@ PROJECT = [chat("p1", "Project chat in main list", gizmo_id="g-p-1"), chat("p2",
 
 
 class FakeApi:
+    requests = retried = 0
+
     def __init__(self, fail_ids=()):
         self.calls, self.fail_ids = [], set(fail_ids)
 
@@ -41,7 +50,7 @@ class FakeApi:
 
 
 def args(*argv):
-    return m.parse_args(["--authorization", "x", *argv])
+    return m.parse_args(["--authorization", "h.p.s", *argv])
 
 
 def select(*argv):
@@ -78,12 +87,18 @@ class Parsing(unittest.TestCase):
         self.assertFalse(args().exclude_pinned)
 
     def test_token_source(self):
-        with mock.patch.dict(os.environ, {"CHATGPT_ACCESS_TOKEN": "env"}):
-            self.assertEqual(m.parse_args(["--authorization", "flag"]).authorization, "flag")
-            self.assertEqual(m.parse_args([]).authorization, "env")
+        with mock.patch.dict(os.environ, {"CHATGPT_ACCESS_TOKEN": "e.n.v"}):
+            self.assertEqual(m.parse_args(["--authorization", "f.l.ag"]).authorization, "f.l.ag")
+            self.assertEqual(m.parse_args([]).authorization, "e.n.v")
         with mock.patch.dict(os.environ, {}, clear=True), redirect_stderr(io.StringIO()):
             self.assertRaises(SystemExit, m.parse_args, [])
             self.assertRaises(SystemExit, m.parse_args, ["--authorization", "Bearer x"])
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertRaises(SystemExit, m.parse_args, ["--authorization", " Bearer h.p.s"])
+            self.assertIn("no 'Bearer '", err.getvalue())
+            self.assertRaises(SystemExit, m.parse_args, ["--authorization", "❯ ./chatgpt_chats_bulk_remove.py"])
+            self.assertRaises(SystemExit, m.parse_args, ["--authorization", "токен.x.y"])
         self.assertEqual(m.Api("eyJ").auth, "Bearer eyJ")
 
 
@@ -171,18 +186,63 @@ class EarlyStop(unittest.TestCase):
 
     def dry_run(self, *argv):
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(m, "Api", return_value=FakeApi()), redirect_stdout(out), redirect_stderr(err):
-            self.assertEqual(m.main(["--authorization", "x", "--dry-run", *argv]), 0)
+        with mock.patch.object(m, "Api", return_value=FakeApi()), \
+                mock.patch.object(m, "out", Console(file=out, width=200)), \
+                mock.patch.object(m, "err", Console(file=err, width=200)):
+            self.assertEqual(m.main(["--authorization", "h.p.s", "--dry-run", *argv]), 0)
         return out.getvalue(), err.getvalue()
 
     def test_dry_run_output(self):
         out, err = self.dry_run("--exclude-pinned", "--exclude-title-contains", "only")
-        self.assertIn("REASON", err)
-        self.assertRegex(err, r"a2 .* pinned +Pinned chat")
-        self.assertRegex(err, r"p2 .* title has 'only' +Project only")
-        self.assertIn("3 to delete, 2 excluded\n", err)
-        self.assertNotIn("REASON", out)
+        self.assertIn("Reason", err)
+        self.assertRegex(err, r"a2 .* pinned .* Pinned chat")
+        self.assertRegex(err, r"p2 .* title has 'only' .* Project only")
+        self.assertIn("3 to delete · 2 excluded", err)
+        self.assertIn("Read 5 chats", err)
+        self.assertIn("To delete (3)", out)
+        self.assertNotIn("Reason", out)
         self.assertNotIn("a2", out)
+
+    def test_table_keeps_ids_and_raw_titles_at_80_columns(self):
+        buf = io.StringIO()
+        c = chat("6720a1b2-0000-8000-aaaa-123456789abc", "Fix :x: bug " + "long " * 20)
+        Console(file=buf, width=80, emoji=False).print(m.table([c], "t", width=80))
+        self.assertIn("6720a1b2-0000-8000-aaaa-123456789abc", buf.getvalue())
+        self.assertIn("Fix :x: bug", buf.getvalue())
+
+    def test_table_hides_empty_columns_and_counts_reasons(self):
+        buf = io.StringIO()
+        chats = [chat("a", "Line one\nline two"), chat("b", "B")]
+        Console(file=buf, width=200).print(m.table(chats, "t", ["pinned", "pinned"]))
+        text = buf.getvalue()
+        self.assertNotIn("Project", text)
+        self.assertNotIn("Pinned", text)
+        self.assertNotIn("Archived", text)
+        self.assertIn("pinned: 2", text)
+        Console(file=io.StringIO()).print(m.table(chats, "t", ["title has '[/]'", "pinned"]))  # No MarkupError.
+        self.assertIn("Line one line two", text)
+
+    def test_title_and_reason_visible_at_80_columns(self):
+        buf = io.StringIO()
+        c = chat("6720a1b2-0000-8000-aaaa-123456789abc", "Перевод рецепта печенья на немецкий язык",
+                 pinned_time="2026-01-01T00:00:00Z", project="Work")
+        Console(file=buf, width=80, emoji=False).print(m.table([c], "t", ["title has 'рецепт'"], width=80))
+        self.assertIn("Перевод", buf.getvalue())
+        self.assertIn("6720a1b2-0000-8000-aaaa-123456789abc", buf.getvalue())
+        self.assertTrue(all(len(line) <= 80 for line in buf.getvalue().splitlines()))
+
+    def test_backslash_title_keeps_link(self):
+        buf = io.StringIO()
+        Console(file=buf, width=200).print(m.table([chat("x1", "trail\\\\\\")], "t", width=200))
+        self.assertIn("trail\\\\\\", buf.getvalue())
+        self.assertNotIn("[/link]", buf.getvalue())
+
+    def test_ids_and_titles_link_to_chat(self):
+        buf = io.StringIO()
+        c = chat("6720a1b2-0000-8000-aaaa-123456789abc", "Hello", gizmo_id="g-p-1", project="Work")
+        Console(file=buf, width=200, force_terminal=True).print(m.table([c], "t", width=200))
+        self.assertEqual(buf.getvalue().count("https://chatgpt.com/c/6720a1b2-0000-8000-aaaa-123456789abc"), 2)
+        self.assertIn("https://chatgpt.com/g/g-p-1/project", buf.getvalue())
 
     def test_dry_run_reports_limit_stop(self):
         _, err = self.dry_run("--exclude-pinned", "--limit", "1")
@@ -195,7 +255,8 @@ class Resp(io.BytesIO):
 
 class Errors(unittest.TestCase):
     def test_retries_timeouts(self):
-        with mock.patch("urllib.request.urlopen", side_effect=[TimeoutError(), Resp(b'{"ok": 1}')]):
+        with mock.patch("urllib.request.urlopen", side_effect=[TimeoutError(), Resp(b'{"ok": 1}')]), \
+                self.assertLogs(m.log, "DEBUG"):
             self.assertEqual(m.Api("x", delay=0, retry_delay=0).call("GET", "me"), {"ok": 1})
 
     def test_logs_retry(self):
@@ -204,6 +265,12 @@ class Errors(unittest.TestCase):
             m.Api("x", delay=0, retry_delay=0).call("GET", "me")
         self.assertTrue(any("retry 1/4 in 0.0s" in line for line in logs.output))
         self.assertTrue(any("GET me -> 200" in line for line in logs.output))
+
+    def test_countdown_shows_time_left(self):
+        shown = []
+        with mock.patch("time.sleep"), mock.patch("time.monotonic", side_effect=[0, 0, 1, 2]):
+            m.countdown(shown.append, "Rate limited", 2)
+        self.assertEqual(shown, ["[yellow]Rate limited in 2s…[/]", "[yellow]Rate limited in 1s…[/]"])
 
     def test_token_expiry(self):
         payload = base64.urlsafe_b64encode(b'{"exp": 0}').decode().rstrip("=")
@@ -214,7 +281,7 @@ class Errors(unittest.TestCase):
         broken = mock.Mock(call=mock.Mock(side_effect=RuntimeError("HTTP Error 403")))
         err = io.StringIO()
         with mock.patch.object(m, "Api", return_value=broken), redirect_stderr(err):
-            self.assertEqual(m.main(["--authorization", "x", "--dry-run"]), 2)
+            self.assertEqual(m.main(["--authorization", "h.p.s", "--dry-run"]), 2)
         self.assertIn("error: HTTP Error 403", err.getvalue())
 
 
@@ -239,7 +306,7 @@ class Delete(unittest.TestCase):
         err = io.StringIO()
         with redirect_stderr(err), self.assertRaises(m.AuthError):
             m.delete_all(Expired(), self.chats)
-        self.assertIn("deleted 0, failed 0, skipped 3", err.getvalue())
+        self.assertIn("deleted 0 · ✖ failed 0 · skipped 3", err.getvalue())
 
     def test_sends_soft_delete_patch(self):
         api = FakeApi()

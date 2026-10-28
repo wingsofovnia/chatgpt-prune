@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = ["rich>=13"]
 # ///
 """Bulk delete ChatGPT chats through the chatgpt.com backend API.
 
@@ -19,14 +19,34 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
+from rich import box
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.markup import escape
+from rich.spinner import SPINNERS
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskProgressColumn, TextColumn, TimeRemainingColumn
+from rich.table import Table
+from rich.text import Text
+
 BASE = "https://chatgpt.com/backend-api"
+WEB = "https://chatgpt.com"  # Links in tables. /c/{id} also opens project chats.
 # Cloudflare returns 403 without a browser User-Agent.
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 PAGE = 100  # API maximum: larger values get HTTP 422.
 WORDS = ["REMOVE", "ERASE", "PURGE", "DISCARD", "DELETE"]
 log = logging.getLogger("chatgpt_chats_bulk_remove")
+# UI (spinner, logs, excluded table, prompts) goes to stderr.
+# stdout gets only the list to delete, so `> file` or a pipe captures just that.
+# Not a terminal (file, pipe): rich falls back to 80 columns and cuts IDs. Use a wide width there.
+# emoji=False: a title with ':x:' must show as typed, not as an emoji.
+err = Console(stderr=True, emoji=False, width=None if sys.stderr.isatty() else 250)
+out = Console(emoji=False, width=None if sys.stdout.isatty() else 250)
+# Built-in emoji frames end in a space, and the status line adds one more. Add trimmed copies.
+for name in ("clock", "runner"):
+    SPINNERS[f"{name}_trim"] = {**SPINNERS[name], "frames": [f.strip() for f in SPINNERS[name]["frames"]]}
 FIELDS = ["id", "title", "create_time", "update_time", "pinned_time", "is_archived", "gizmo_id", "project"]
 
 
@@ -70,17 +90,30 @@ def token_expiry(token):
         return None
 
 
+def countdown(show, text, seconds):
+    """Sleep for seconds. Call show() with the time left, once per second."""
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0:
+        show(f"[yellow]{escape(text)} in {left:.0f}s…[/]")
+        time.sleep(min(1.0, left))
+
+
 class Api:
+    on_wait_default = staticmethod(lambda text, seconds: time.sleep(seconds))
+
     def __init__(self, auth, delay=2.0, retries=4, retry_delay=10.0):
         self.auth = f"Bearer {auth}"
         self.delay, self.retries, self.retry_delay = delay, retries, retry_delay
         self.last = 0.0
+        self.requests = self.retried = 0  # For the summary line.
+        self.on_wait = Api.on_wait_default  # The UI replaces it to show a countdown.
 
     def call(self, method, path, body=None):
         url = f"{BASE}/{path}"
         data = None if body is None else json.dumps(body).encode()
         headers = {"Authorization": self.auth, "User-Agent": UA, "Accept": "application/json", "Content-Type": "application/json"}
         for attempt in range(self.retries + 1):
+            self.requests += 1
             time.sleep(max(0.0, self.last + self.delay - time.monotonic()))
             self.last = time.monotonic()
             try:
@@ -94,16 +127,19 @@ class Api:
                     raise AuthError("HTTP 401: token is expired or not valid. Get a new token.") from None
                 if (e.code != 429 and e.code < 500) or attempt == self.retries:
                     raise
+                why = "rate limited (HTTP 429)" if e.code == 429 else f"HTTP {e.code}"
                 # ChatGPT sends no Retry-After today (checked 2026-10). Kept in case Cloudflare or the API add it.
                 retry_after = e.headers.get("Retry-After") or ""
                 wait = float(retry_after) if retry_after.isdigit() else self.retry_delay * 2**attempt
             except OSError as e:  # URLError, timeouts, connection resets
                 log.debug("%s %s -> %s", method, path, getattr(e, "reason", e))
+                why = f"network error ({getattr(e, 'reason', e)})"
                 if attempt == self.retries:
                     raise
                 wait = self.retry_delay * 2**attempt
-            log.debug("retry %d/%d in %.1fs", attempt + 1, self.retries, wait)
-            time.sleep(wait)
+            log.debug("%s, retry %d/%d in %.1fs", why, attempt + 1, self.retries, wait)
+            self.retried += 1
+            self.on_wait(f"{why[0].upper()}{why[1:]}, retry {attempt + 1}/{self.retries}", wait)
 
 
 def paged_offset(api, archived):
@@ -163,7 +199,7 @@ def list_chats(api, a):
             yield c
 
 
-def find_chats(api, a):
+def find_chats(api, a, progress=lambda read, to_delete, excluded: None):
     """Return (to_delete, excluded, stopped), newest update first. excluded is [(chat, reason)].
 
     Stop reading pages after --limit chats to delete. stopped is True if older chats exist that are not checked.
@@ -172,13 +208,13 @@ def find_chats(api, a):
     chats = list_chats(api, a)
     for c in chats:
         read += 1
-        if not selected(c, a):
-            continue
-        reason = excluded_by(c, a)
-        if reason:
-            excluded.append((c, reason))
-            continue
-        to_delete.append(c)
+        if selected(c, a):
+            reason = excluded_by(c, a)
+            if reason:
+                excluded.append((c, reason))
+            else:
+                to_delete.append(c)
+        progress(read, len(to_delete), len(excluded))
         if len(to_delete) == a.limit:
             try:
                 stopped = next(chats, None) is not None
@@ -224,41 +260,86 @@ def excluded_by(c, a):
     return None
 
 
-def render(chats, fmt, reasons=None):
-    """reasons: one string per chat. Adds a REASON column to the table."""
+def render(chats, fmt):
+    """Plain text for --output ids and json."""
     if fmt == "ids":
         return "\n".join(c["id"] for c in chats)
-    if fmt == "json":
-        return json.dumps([{k: c.get(k) for k in FIELDS} for c in chats], indent=2, ensure_ascii=False)
-    reasons = reasons or [""] * len(chats)
-    w = max(map(len, reasons), default=0)
-    col = lambda r: f"{r:{w}}  " if w else ""
-    lines = [f"{'ID':36}  {'CREATED':10}  {'UPDATED':10}  {'PA':2}  {'PROJECT':20}  {col('REASON')}TITLE"]
-    for c, r in zip(chats, reasons):
-        flags = ("P" if c.get("pinned_time") else "-") + ("A" if c.get("is_archived") else "-")
-        lines.append(f"{c['id']:36}  {c['create_time'][:10]:10}  {(c.get('update_time') or '')[:10]:10}  {flags}  "
-                     f"{(c.get('project') or '')[:20]:20}  {col(r)}{c.get('title') or ''}")
-    return "\n".join(lines)
+    return json.dumps([{k: c.get(k) for k in FIELDS} for c in chats], indent=2, ensure_ascii=False)
+
+
+def table(chats, title, reasons=None, color="red", width=250):
+    """Rich table. reasons: one string per chat. Adds a dimmed Reason column and a count per reason.
+
+    Project, Pinned (📌) and Archived (📦) are hidden when no row has a value.
+    Column widths are set here, so rich does not shrink columns. If the table does not fit in width,
+    Created, Project, Updated, Archived and Pinned are hidden in that order. ID, Reason and Title always stay.
+    Below about 70 columns nothing fits, and rich cuts the table.
+    """
+    titles = {c["id"]: " ".join((c.get("title") or "").split()) for c in chats}  # Line breaks would split a row.
+    project_w = min(20, max((len(c.get("project") or "") for c in chats), default=0))
+    cols = [("ID", 36), ("Created", 10), ("Updated", 10)]  # (name, width). Never cut: the ID is what you check.
+    if any(c.get("pinned_time") for c in chats):
+        cols.append(("Pinned", 6))
+    if any(c.get("is_archived") for c in chats):
+        cols.append(("Archived", 8))
+    if project_w:
+        cols.append(("Project", max(project_w, 7)))
+    if reasons:
+        cols.append(("Reason", min(20, max(6, *map(len, reasons)))))
+    border = lambda n: 3 * n + 1  # Each column adds 2 padding + 1 border line.
+    for drop in ("Created", "Project", "Updated", "Archived", "Pinned"):
+        if sum(w for _, w in cols) + border(len(cols) + 1) + 20 <= width:
+            break
+        cols = [col for col in cols if col[0] != drop]
+    free = width - sum(w for _, w in cols) - border(len(cols) + 1)
+    if free < 20 and reasons:  # Still too wide: Reason gives up space first, down to 8 cells.
+        r_w = dict(cols)["Reason"]
+        cols = [(n, max(8, r_w - (20 - free)) if n == "Reason" else w) for n, w in cols]
+        free = width - sum(w for _, w in cols) - border(len(cols) + 1)
+    cols.append(("Title", max(12, min(free, max(map(len, titles.values()), default=5)))))
+
+    # Text cells, not markup: a title like 'a\\\\' or '[/]' must not break the link tags.
+    link = lambda text, url: Text(text, style=f"link {url}")
+    cell = {
+        "ID": lambda c, r: link(c["id"], f"{WEB}/c/{c['id']}"),
+        "Created": lambda c, r: c["create_time"][:10],
+        "Updated": lambda c, r: (c.get("update_time") or "")[:10],
+        "Pinned": lambda c, r: "📌" if c.get("pinned_time") else "",
+        "Archived": lambda c, r: "📦" if c.get("is_archived") else "",
+        "Project": lambda c, r: link(c["project"], f"{WEB}/g/{c['gizmo_id']}/project") if c.get("project") else "",
+        "Reason": lambda c, r: Text(r),
+        "Title": lambda c, r: link(titles[c["id"]], f"{WEB}/c/{c['id']}"),
+    }
+    # Title and Reason wrap inside their width. All other columns keep one line.
+    options = {"Project": {"no_wrap": True, "overflow": "ellipsis"}, "Reason": {"style": "yellow"}, "Title": {},
+               "Pinned": {"no_wrap": True, "justify": "center"}, "Archived": {"no_wrap": True, "justify": "center"}}
+    caption = " · ".join(f"{escape(r)}: {n}" for r, n in Counter(reasons).most_common()) if reasons else None
+    t = Table(title=title, title_justify="left", title_style=f"bold {color}", border_style=color, box=box.ROUNDED,
+              caption=caption, caption_justify="left", row_styles=["dim"] if reasons else None)
+    for name, w in cols:
+        t.add_column(name, width=w, **options.get(name, {"no_wrap": True}))
+    for i, c in enumerate(chats):
+        t.add_row(*(cell[name](c, reasons[i] if reasons else None) for name, _ in cols))
+    return t
 
 
 def ask(prompt):
-    # Prompt on stderr, so `> file` gets only the list.
-    print(prompt, end="", file=sys.stderr, flush=True)
-    return input().strip()
+    """prompt is rich markup. Shown on stderr, so `> file` gets only the list."""
+    return err.input(prompt, emoji=False).strip()
 
 
 def pick(chats):
     """Ask for each chat. y = delete, n = keep, a = delete this and all next, q = stop asking."""
-    out = []
+    picked = []
     for i, c in enumerate(chats):
-        ans = ask(f"[{i + 1}/{len(chats)}] delete {c['id']} {c.get('title')!r}? [y/N/a/q] ").lower()
+        ans = ask(escape(f"[{i + 1}/{len(chats)}] delete {c['id']} {c.get('title')!r}? [y/N/a/q] ")).lower()
         if ans == "q":
             break
         if ans == "a":
-            return out + chats[i:]
+            return picked + chats[i:]
         if ans == "y":
-            out.append(c)
-    return out
+            picked.append(c)
+    return picked
 
 
 def delete_all(api, chats, continue_on_error=False):
@@ -267,24 +348,39 @@ def delete_all(api, chats, continue_on_error=False):
     Print a summary at the end, also after an error or Ctrl-C.
     """
     deleted, failed = [], []
+    bar = Progress(TextColumn("{task.description}"), BarColumn(), MofNCompleteColumn(), TaskProgressColumn(),
+                   TimeRemainingColumn(), console=err)
     try:
-        for c in chats:
-            try:
-                r = api.call("PATCH", f"conversation/{c['id']}", {"is_visible": False})
-                if not r.get("success"):
-                    raise RuntimeError(f"unexpected response: {r}")
-            except AuthError:
-                raise
-            except Exception as e:
-                failed.append(c)
-                print(f"failed {c['id']}: {e}", file=sys.stderr)
-                if not continue_on_error:
-                    break
-            else:
-                deleted.append(c)
-                print(f"deleted {c['id']}", file=sys.stderr)
+        with bar:
+            task = bar.add_task("Deleting", total=len(chats))
+
+            def waiting(text, seconds):
+                countdown(lambda t: bar.update(task, description=f"⏳ {t}"), text, seconds)
+                bar.update(task, description="🏃 [yellow]Retrying…[/]")
+
+            api.on_wait = waiting
+            done = lambda: bar.update(task, advance=1, description="Deleting")
+            for c in chats:
+                try:
+                    r = api.call("PATCH", f"conversation/{c['id']}", {"is_visible": False})
+                    if not r.get("success"):
+                        raise RuntimeError(f"unexpected response: {r}")
+                except AuthError:
+                    raise
+                except Exception as e:
+                    failed.append(c)
+                    done()
+                    err.print(Text.assemble(("✖ failed ", "red"), f"{c['id']}: {e}"))
+                    if not continue_on_error:
+                        break
+                else:
+                    deleted.append(c)
+                    done()
+                    err.print(Text.assemble(("✔ ", "green"), f"deleted {c['id']}  ", (c.get("title") or "", "dim")))
     finally:
-        print(f"deleted {len(deleted)}, failed {len(failed)}, skipped {len(chats) - len(deleted) - len(failed)}", file=sys.stderr)
+        api.on_wait = Api.on_wait_default
+        err.print(f"[green]✔ deleted {len(deleted)}[/] · [red]✖ failed {len(failed)}[/] · "
+                  f"skipped {len(chats) - len(deleted) - len(failed)}")
     return deleted, failed
 
 
@@ -328,66 +424,95 @@ def parse_args(argv):
         p.error("--limit must be 1 or more")
     if min(a.retries, a.delay, a.retry_delay) < 0:
         p.error("--retries, --delay and --retry-delay must be 0 or more")
-    a.authorization = a.authorization or os.environ.get("CHATGPT_ACCESS_TOKEN")
+    a.authorization = (a.authorization or os.environ.get("CHATGPT_ACCESS_TOKEN") or "").strip()
     if not a.authorization:
         p.error("give --authorization or set CHATGPT_ACCESS_TOKEN")
-    if a.authorization.lower().startswith("bearer "):
-        p.error("give the plain JWT, without 'Bearer '")
+    # Smoke test only. The server rejects a bad token. Non-ASCII would crash before any request.
+    if not a.authorization.isascii() or " " in a.authorization or a.authorization.count(".") != 2:
+        p.error("not a plain JWT (eyJ..., no 'Bearer '). Is the clipboard holding something else?")
     return a
 
 
 def main(argv=None):
     a = parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.WARNING, stream=sys.stderr,
-                        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S", force=True)
+    # No log output at all without --verbose.
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.CRITICAL + 1, format="%(message)s", force=True,
+                        handlers=[RichHandler(console=err, show_path=False, log_time_format="%H:%M:%S")])
     exp = token_expiry(a.authorization)
     if exp and exp < datetime.now(timezone.utc):
         log.warning("token expired at %s. Get a new token.", exp.isoformat(timespec="minutes"))
-    log.debug("token expires %s", exp.isoformat(timespec="minutes") if exp else "unknown (not a JWT)")
+    log.debug("token expires %s", exp.isoformat(timespec="minutes") if exp else "unknown (unreadable payload)")
     api = Api(a.authorization, a.delay, a.retries, a.retry_delay)
     try:
-        chats, excluded, stopped = find_chats(api, a)
+        checked, retrying, started = 0, False, time.monotonic()
+
+        def reading(n, d, e):
+            nonlocal checked, retrying
+            checked = n
+            text = f"Reading chats… checked {n} · to delete {d} · excluded {e}"
+            # Back to dots after a retry. Only then: a new spinner restarts its animation.
+            status.update(text, **({"spinner": "dots"} if retrying else {}))
+            retrying = False
+
+        with err.status("Reading chats…") as status:
+            def waiting(text, seconds):
+                nonlocal retrying
+                status.update(spinner="clock_trim")  # Once: a new spinner restarts its animation.
+                countdown(status.update, text, seconds)
+                status.update("[yellow]Retrying…[/]", spinner="runner_trim")
+                retrying = True
+
+            api.on_wait = waiting
+            try:
+                chats, excluded, stopped = find_chats(api, a, reading)
+            finally:
+                api.on_wait = Api.on_wait_default
+        err.print(f"[green]✔[/] Read {checked} chats in {time.monotonic() - started:.0f}s · "
+                  f"{api.requests} requests · {api.retried} retries")
 
         # Stage 2 result first, so the list to delete is next to the prompt.
         if excluded:
-            print("Excluded, not deleted:", file=sys.stderr)
             cs, rs = zip(*excluded)
-            print(render(cs, "table", reasons=rs) + "\n", file=sys.stderr)
+            err.print(table(cs, f"🛡  Excluded, not deleted ({len(excluded)})", rs, color="yellow", width=err.width))
         if a.exclude_archived:
-            print("Archive not read (--exclude-archived).", file=sys.stderr)
+            err.print("[dim]Archive not read (--exclude-archived).[/]")
         if a.exclude_project_chats:
-            print("Project chat lists not read (--exclude-project-chats). Only project chats in the main list are shown.", file=sys.stderr)
-        print("To delete:", file=sys.stderr, flush=True)
-        print(render(chats, a.output), flush=True)
+            err.print("[dim]Project chat lists not read (--exclude-project-chats). Only project chats in the main list are shown.[/]")
+        err.print()  # Blank line between the excluded and the to-delete lists.
+        if a.output == "table":
+            out.print(table(chats, f"🗑  To delete ({len(chats)})", width=out.width))
+        else:
+            err.print(f"To delete ({len(chats)}):")
+            print(render(chats, a.output), flush=True)
         cutoff = ". Stopped at --limit: older chats not checked" if stopped else ""
-        print(f"{len(chats)} to delete, {len(excluded)} excluded{cutoff}", file=sys.stderr)
+        err.print(f"[bold]{len(chats)} to delete · {len(excluded)} excluded[/]{cutoff}")
 
         if a.dry_run or not chats:
-            print("dry run: nothing deleted" if a.dry_run else "nothing to delete", file=sys.stderr)
+            err.print("[dim]Dry run: nothing deleted.[/]" if a.dry_run else "Nothing to delete.")
             return 0
         if (a.interactive or not a.yes) and not sys.stdin.isatty():
-            print("error: confirmation needs a terminal. Use --yes to skip it.", file=sys.stderr)
+            err.print("[red]error:[/] confirmation needs a terminal. Use --yes to skip it.")
             return 2
         if a.interactive:
             chats = pick(chats)
             if not chats:
-                print("no chats picked: nothing deleted", file=sys.stderr)
+                err.print("No chats picked: nothing deleted.")
                 return 0
         if not a.yes:
             word = random.choice(WORDS)
-            if ask(f"Delete {len(chats)} chats permanently? Type {word} to confirm: ") != word:
-                print("aborted: nothing deleted", file=sys.stderr)
+            if ask(f"Delete {len(chats)} chats permanently? Type [bold red]{word}[/] to confirm: ") != word:
+                err.print("Aborted: nothing deleted.")
                 return 1
 
         _, failed = delete_all(api, chats, a.continue_on_error)
         return 1 if failed else 0
     except (KeyboardInterrupt, EOFError):
-        print("\naborted", file=sys.stderr)
+        err.print("\nAborted.")
         return 1
     except Exception as e:
         if a.verbose:
             raise
-        print(f"error: {e}", file=sys.stderr)
+        err.print(f"[red]error:[/] {escape(str(e))}")
         return 2
 
 
