@@ -28,6 +28,13 @@ ARCHIVED = [chat("r1", "Old archived", created="2025-05-01T00:00:00Z", is_archiv
 PROJECT = [chat("p1", "Project chat in main list", gizmo_id="g-p-1"), chat("p2", "Project only", gizmo_id="g-p-1")]
 
 
+def page(path, items):
+    """Slice items by the offset and limit in path, as the API does."""
+    q = dict(p.split("=", 1) for p in path.split("?", 1)[1].split("&"))
+    start = int(q.get("offset", 0))
+    return items[start:start + int(q.get("limit", m.PAGE))]
+
+
 class FakeApi:
     requests = retried = 0
 
@@ -41,7 +48,7 @@ class FakeApi:
                 raise RuntimeError("boom")
             return {"success": True}
         if path.startswith("conversations?"):
-            return {"items": ARCHIVED if "is_archived=true" in path else ACTIVE}
+            return {"items": page(path, ARCHIVED if "is_archived=true" in path else ACTIVE)}
         if path.startswith("gizmos/snorlax/sidebar"):
             return {"items": [{"gizmo": {"gizmo": {"id": "g-p-1", "display": {"name": "Work"}}}}], "cursor": None}
         if path.startswith("gizmos/g-p-1/conversations"):
@@ -69,10 +76,7 @@ class Parsing(unittest.TestCase):
     def test_dates(self):
         utc = timezone.utc
         self.assertEqual(m.parse_date("2026-10-29"), datetime(2026, 10, 29, tzinfo=utc))
-        self.assertEqual(m.parse_date("2026-10-29", end=True), datetime(2026, 10, 29, 23, 59, 59, 999999, tzinfo=utc))
         self.assertEqual(m.parse_date("2026-10-29T09:03:50.719809Z"), datetime(2026, 10, 29, 9, 3, 50, 719809, tzinfo=utc))
-        self.assertEqual(m.parse_date("20261029", end=True), datetime(2026, 10, 29, 23, 59, 59, 999999, tzinfo=utc))
-        self.assertEqual(m.parse_date("2026-10-29T00:00:00", end=True), datetime(2026, 10, 29, tzinfo=utc))
 
     def test_durations(self):
         self.assertEqual([m.parse_duration(s) for s in ("500ms", "2s", "1m", "1.5")], [0.5, 2.0, 60.0, 1.5])
@@ -121,8 +125,8 @@ class Filters(unittest.TestCase):
 
     def test_title_and_time(self):
         self.assertEqual(select("--title-contains", "PROJECT", "--exclude-title-contains", "only"), ["p1"])
-        self.assertEqual(select("--create-time-to", "2025-05-01"), ["r1"])
-        self.assertEqual(select("--create-time-from", "2026-01-10T10:00:00.000001Z"), [])
+        self.assertEqual(select("--created-before", "2025-05-02"), ["r1"])
+        self.assertEqual(select("--created-after", "2026-01-10T10:00:00.000001Z"), [])
 
     def test_exclude_project_name_keeps_unknown_projects(self):
         shared = chat("s1", "Shared", gizmo_id="g-p-shared")
@@ -142,22 +146,28 @@ class Filters(unittest.TestCase):
         self.assertFalse(any("is_archived=true" in p or p.startswith("gizmos/") for _, p in api.calls))
 
     def test_selection_drops_are_not_listed(self):
-        self.assertEqual(excluded("--project-name", "Work", "--update-time-to", "2025-12-31"), {})
+        self.assertEqual(excluded("--project-name", "Work", "--updated-before", "2026-01-01"), {})
 
     def test_title_contains_selects_silently(self):
         self.assertEqual(excluded("--title-contains", "plain"), {})
 
 
 class PagedApi(FakeApi):
-    """Main list: 2 full pages, chat c<i> updated i days before 2026-10-01. No archive, no projects."""
+    """Main list: 2 full pages, chat c<i> created and updated i days before 2026-10-01. No archive, no projects."""
+
+    def __init__(self, swap=None):
+        super().__init__()
+        day0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        when = lambda i: (day0 - timedelta(days=i)).isoformat()
+        self.items = [chat(f"c{i}", f"c{i}", created=when(i), updated=when(i)) for i in range(2 * m.PAGE)]
+        if swap:  # Put two chats out of order.
+            i, j = swap
+            self.items[i], self.items[j] = self.items[j], self.items[i]
 
     def call(self, method, path, body=None):
         self.calls.append((method, path))
         if "is_archived=false" in path:
-            start = int(path.split("offset=")[1].split("&")[0])
-            day0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
-            return {"items": [chat(f"c{i}", f"c{i}", updated=(day0 - timedelta(days=i)).isoformat())
-                              for i in range(start, min(start + m.PAGE, 2 * m.PAGE))]}
+            return {"items": page(path, self.items)}
         return {"items": [], "cursor": None}
 
 
@@ -167,10 +177,52 @@ class EarlyStop(unittest.TestCase):
         self.assertEqual([c["id"] for c in m.find_chats(api, args("--limit", "3"))[0]], ["c0", "c1", "c2"])
         self.assertFalse(any(f"offset={m.PAGE}" in p for _, p in api.calls))
 
-    def test_update_time_from_stops_paging(self):
+    def test_updated_after_stops_paging(self):
         api = PagedApi()
-        self.assertEqual(len(m.find_chats(api, args("--update-time-from", "2026-09-10"))[0]), 22)
+        self.assertEqual(len(m.find_chats(api, args("--updated-after", "2026-09-10"))[0]), 22)
         self.assertFalse(any(f"offset={m.PAGE}" in p for _, p in api.calls))
+
+    def test_before_skips_newer_pages(self):
+        for flag in ("--updated-before", "--created-before"):
+            api = PagedApi()
+            # c150 is 2026-05-04 00:00, the newest chat before the cutoff. c149 is 2026-05-05 00:00, not before it.
+            to_delete = m.find_chats(api, args(flag, "2026-05-05"))[0]
+            self.assertEqual([c["id"] for c in to_delete], [f"c{i}" for i in range(150, 200)], flag)
+            self.assertNotIn(("GET", "conversations?offset=0&limit=100&order=" + ("updated" if "update" in flag else "created")
+                              + "&is_archived=false"), api.calls, flag)
+
+    def test_create_time_uses_created_order(self):
+        api = PagedApi()
+        m.find_chats(api, args("--created-after", "2026-09-01"))
+        self.assertTrue(all("order=created" in p for _, p in api.calls if p.startswith("conversations?")))
+
+    def test_unsorted_list_fails_when_order_matters(self):
+        for swap in ((0, 1), (99, 100)):  # In one page, and across a page boundary.
+            with self.assertRaisesRegex(RuntimeError, "not sorted by updated time"):
+                m.find_chats(PagedApi(swap), args("--updated-after", "2020-01-01"))
+        m.find_chats(PagedApi((0, 1)), args())  # No time filter, no --limit: order does not matter.
+        with self.assertRaisesRegex(RuntimeError, "not sorted"):  # Also when the bad chat is the --limit peek.
+            m.find_chats(PagedApi((2, 3)), args("--limit", "3"))
+
+    def test_created_order_sorts_project_lists(self):
+        class Api(FakeApi):
+            def call(self, method, path, body=None):
+                if path.startswith("gizmos/g-p-1/conversations"):  # Newest update first, not newest create.
+                    return {"cursor": None, "items": [
+                        chat("q1", "old", created="2026-01-01T00:00:00Z", updated="2026-06-01T00:00:00Z", gizmo_id="g-p-1"),
+                        chat("q2", "new", created="2026-03-01T00:00:00Z", updated="2026-05-01T00:00:00Z", gizmo_id="g-p-1")]}
+                return super().call(method, path, body)
+        to_delete = m.find_chats(Api(), args("--created-after", "2026-02-01"))[0]
+        self.assertEqual([c["id"] for c in to_delete], ["q2"])
+
+    def test_seek_reads_few_probes_on_small_lists(self):
+        api = PagedApi()
+        m.find_chats(api, args("--exclude-archived", "--updated-before", "2026-05-05"))
+        self.assertEqual(sum("limit=1&" in p for _, p in api.calls), 2)  # Offsets 100 and 200.
+
+    def test_mixed_time_kinds_rejected(self):
+        with redirect_stderr(io.StringIO()):
+            self.assertRaises(SystemExit, args, "--created-before", "2026-01-01", "--updated-before", "2026-01-01")
 
     def test_merges_sources_newest_first(self):
         times = [m.updated(c) for c in m.find_chats(FakeApi(), args())[0]]

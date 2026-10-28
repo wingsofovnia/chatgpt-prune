@@ -20,7 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from rich import box
 from rich.console import Console
@@ -62,23 +62,10 @@ def parse_duration(s):
     return float(s)
 
 
-def parse_date(s, end=False):
-    """ISO date or datetime. No zone means UTC. With end=True, a plain date means the end of that day."""
+def parse_date(s):
+    """ISO date or datetime. No zone means UTC. A plain date means 00:00 of that day."""
     dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    if end and is_plain_date(s):
-        dt += timedelta(days=1, microseconds=-1)
-    return dt
-
-
-def is_plain_date(s):
-    """True for a date with no time: '2026-10-29', '20261029'."""
-    try:
-        date.fromisoformat(s)
-        return True
-    except ValueError:
-        return False
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def token_expiry(token):
@@ -142,14 +129,61 @@ class Api:
             self.on_wait(f"{why[0].upper()}{why[1:]}, retry {attempt + 1}/{self.retries}", wait)
 
 
-def paged_offset(api, archived):
-    offset = 0
+def list_url(archived, a, offset, limit):
+    """One URL for page reads and seek probes, so both see the same list."""
+    return f"conversations?offset={offset}&limit={limit}&order={a.order}&is_archived={archived}"
+
+
+def paged_offset(api, archived, a):
+    """Yield chats from the main list or the archive, newest first by a.key. With --*-before, skip ahead first."""
+    offset = seek(api, archived, a) if a.before else 0
     while True:
-        items = api.call("GET", f"conversations?offset={offset}&limit={PAGE}&order=updated&is_archived={archived}").get("items") or []
+        items = api.call("GET", list_url(archived, a, offset, PAGE)).get("items") or []
         yield from items
         if len(items) < PAGE:
             return
         offset += len(items)
+
+
+def seek(api, archived, a):
+    """Return the offset where chats older than a.before start, minus a margin. Reads 1 chat per request.
+
+    The list is newest first. Exponential search for an upper bound, then binary search
+    until the range fits in one page: reading that page costs less than more probes.
+    """
+    def older(k):
+        items = api.call("GET", list_url(archived, a, k, 1)).get("items") or []
+        return not items or a.key(items[0]) < a.before
+
+    lo, hi = 0, PAGE
+    while hi < 10**7 and not older(hi):
+        lo, hi = hi + 1, hi * 2
+    while hi - lo > PAGE:
+        mid = (lo + hi) // 2
+        if older(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    log.debug("%s: skip to offset %d", "archive" if archived == "true" else "main list", max(0, lo - 10))
+    # Margin: a chat deleted or archived elsewhere during the search moves older chats up. An update is safe.
+    return max(0, lo - 10)
+
+
+def ordered(chats, a):
+    """Yield chats. Fail if the chats read are not newest first by a.key, when the order matters.
+
+    Early stop, seek and --limit need this order. Chats that seek skips are not read, so not checked.
+    """
+    if not (a.after or a.before or a.limit):
+        yield from chats
+        return
+    last = None
+    for c in chats:
+        key = a.key(c)
+        if last is not None and key > last:
+            raise RuntimeError(f"the chat list is not sorted by {a.order} time (at chat {c['id']})")
+        last = key
+        yield c
 
 
 def paged_cursor(api, path, cursor=None):
@@ -172,26 +206,34 @@ def updated(c):
     return parse_date(c.get("update_time") or c["create_time"])
 
 
+def created(c):
+    return parse_date(c["create_time"])
+
+
 def list_chats(api, a):
-    """Yield chats from the main list, the archive and each project. Newest update first, no duplicates.
+    """Yield chats from the main list, the archive and each project. Newest first by a.key, no duplicates.
 
     Pages are read only when needed. Each source is newest first, so a merge keeps that order.
+    With --*-before, the main list and the archive skip ahead to it.
     """
     # Excluded sources are not read: nothing from them can be deleted.
-    sources = [paged_offset(api, "false")]
+    sources = [paged_offset(api, "false", a)]
     if not a.exclude_archived:
-        sources.append(paged_offset(api, "true"))
+        sources.append(paged_offset(api, "true", a))
     # The main list does not include all project chats. Read each project too.
     projects = {} if a.exclude_project_chats else list_projects(api)
     wanted = {pid: name for pid, name in projects.items() if not a.project_name or name in a.project_name}
     log.debug("sources: main list%s, %d of %d projects %s", "" if a.exclude_archived else ", archive",
               len(wanted), len(projects), sorted(wanted.values()))
     for pid in wanted:
-        sources.append(paged_cursor(api, f"gizmos/{pid}/conversations", cursor=0))
+        chats = paged_cursor(api, f"gizmos/{pid}/conversations", cursor=0)
+        # Project lists come by update time. For create time, read them fully and sort.
+        sources.append(chats if a.order == "updated" else sorted(chats, key=a.key, reverse=True))
     seen = set()
-    for c in heapq.merge(*sources, key=updated, reverse=True):
-        if a.update_time_from and updated(c) < a.update_time_from:
-            log.debug("stop reading: next chat is older than --update-time-from")
+    # The merge keeps each source's order, so one check on its output catches any unsorted source.
+    for c in ordered(heapq.merge(*sources, key=a.key, reverse=True), a):
+        if a.after and a.key(c) < a.after:
+            log.debug("stop reading: next chat is older than --%s-after", a.order)
             return  # All next chats are older.
         if c["id"] not in seen:
             seen.add(c["id"])
@@ -200,7 +242,7 @@ def list_chats(api, a):
 
 
 def find_chats(api, a, progress=lambda read, to_delete, excluded: None):
-    """Return (to_delete, excluded, stopped), newest update first. excluded is [(chat, reason)].
+    """Return (to_delete, excluded, stopped), newest first by a.key. excluded is [(chat, reason)].
 
     Stop reading pages after --limit chats to delete. stopped is True if older chats exist that are not checked.
     """
@@ -218,7 +260,7 @@ def find_chats(api, a, progress=lambda read, to_delete, excluded: None):
         if len(to_delete) == a.limit:
             try:
                 stopped = next(chats, None) is not None
-            except Exception:  # The list is complete. A failed peek must not abort the run.
+            except OSError:  # Network error: the list is complete, so do not abort. A sort error must still fail.
                 stopped = True
             break
     log.debug("checked %d chats: %d to delete, %d excluded%s", read, len(to_delete), len(excluded),
@@ -228,13 +270,10 @@ def find_chats(api, a, progress=lambda read, to_delete, excluded: None):
 
 def selected(c, a):
     """Stage 1, select: time window, project and title. Dropped chats are not listed."""
-    created = parse_date(c["create_time"])
     title = (c.get("title") or "").lower()
     return all([
-        a.create_time_from is None or created >= a.create_time_from,
-        a.create_time_to is None or created <= a.create_time_to,
-        a.update_time_from is None or updated(c) >= a.update_time_from,
-        a.update_time_to is None or updated(c) <= a.update_time_to,
+        a.after is None or a.key(c) >= a.after,
+        a.before is None or a.key(c) < a.before,
         not a.project_name or c.get("project") in a.project_name,
         not a.title_contains or any(t.lower() in title for t in a.title_contains),
     ])
@@ -389,11 +428,9 @@ def parse_args(argv):
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     flag = dict(action="store_true")
     p.add_argument("--authorization", help="plain JWT (eyJ...), no 'Bearer '. Default: env CHATGPT_ACCESS_TOKEN. The env is safer: argv shows in ps and shell history.")
-    g = p.add_argument_group("time filters (ISO date or datetime, UTC if no zone; a plain date in -to includes that day)")
-    g.add_argument("--create-time-from", type=parse_date)
-    g.add_argument("--create-time-to", type=lambda s: parse_date(s, end=True))
-    g.add_argument("--update-time-from", type=parse_date)
-    g.add_argument("--update-time-to", type=lambda s: parse_date(s, end=True))
+    g = p.add_argument_group("time filters (ISO date or datetime, UTC if no zone; before excludes it, after includes it)")
+    for name in ("--created-before", "--created-after", "--updated-before", "--updated-after"):
+        g.add_argument(name, type=parse_date)
     g = p.add_argument_group("chat state")
     g.add_argument("--exclude-pinned", **flag)
     g.add_argument("--exclude-project-chats", **flag)
@@ -406,7 +443,7 @@ def parse_args(argv):
     g.add_argument("--exclude-title-contains", action="append", default=[])
     g = p.add_argument_group("safety")
     g.add_argument("--dry-run", **flag, help="list matches, delete nothing")
-    g.add_argument("--limit", type=int, help="delete at most N chats, most recently updated first")
+    g.add_argument("--limit", type=int, help="delete at most N chats, newest first")
     g.add_argument("--interactive", **flag, help="ask for each chat")
     g.add_argument("--yes", **flag, help="skip the typed confirmation")
     g = p.add_argument_group("output")
@@ -418,6 +455,12 @@ def parse_args(argv):
     g.add_argument("--retry-delay", type=parse_duration, default=10.0, help="first retry wait, doubles each time (default 10s)")
     g.add_argument("--continue-on-error", **flag)
     a = p.parse_args(argv)
+    creates, updates = (a.created_after, a.created_before), (a.updated_after, a.updated_before)
+    if any(creates) and any(updates):
+        p.error("--created-* and --updated-* conflict: use one kind")
+    # One sort key per run. It drives the list order, the early stop and the seek.
+    a.order, a.key = ("created", created) if any(creates) else ("updated", updated)
+    a.after, a.before = creates if any(creates) else updates
     if a.project_name and a.exclude_project_chats:
         p.error("--project-name and --exclude-project-chats conflict")
     if a.limit is not None and a.limit < 1:
