@@ -48,7 +48,9 @@ Run `./chatgpt_chats_bulk_remove.py --help` for all flags.
 - With `--exclude-project-name`, the script keeps chats of projects it cannot name (for example, shared projects). It reads names of your own projects only.
 - `--limit` keeps the most recently updated chats.
 - Requests run one at a time. Defaults avoid rate limits: 1s between requests, 3 retries on 429/5xx. Retries honor `Retry-After`.
-- Exit code: 0 = OK, 1 = some deletes failed or you aborted, 2 = auth or usage error.
+- Errors print one line. Add `--verbose` to get the traceback.
+- The delete step prints a summary at the end, also after an error or Ctrl-C.
+- Exit code: 0 = OK, 1 = some deletes failed or you aborted, 2 = auth, API, network or usage error.
 
 ## Tests
 

@@ -77,8 +77,8 @@ class Api:
                     raise
                 retry_after = e.headers.get("Retry-After") or ""
                 wait = float(retry_after) if retry_after.isdigit() else self.retry_delay * 2**attempt
-            except urllib.error.URLError as e:
-                self._log(method, url, e.reason)
+            except OSError as e:  # URLError, timeouts, connection resets
+                self._log(method, url, getattr(e, "reason", e))
                 if attempt == self.retries:
                     raise
                 wait = self.retry_delay * 2**attempt
@@ -190,23 +190,29 @@ def pick(chats):
 
 
 def delete_all(api, chats, continue_on_error=False):
-    """Return (deleted, failed). Without continue_on_error, stop after the first failure."""
+    """Return (deleted, failed). Without continue_on_error, stop after the first failure.
+
+    Print a summary at the end, also after an error or Ctrl-C.
+    """
     deleted, failed = [], []
-    for c in chats:
-        try:
-            r = api.call("PATCH", f"conversation/{c['id']}", {"is_visible": False})
-            if not r.get("success"):
-                raise RuntimeError(f"unexpected response: {r}")
-        except AuthError:
-            raise
-        except Exception as e:
-            failed.append(c)
-            print(f"failed {c['id']}: {e}", file=sys.stderr)
-            if not continue_on_error:
-                break
-        else:
-            deleted.append(c)
-            print(f"deleted {c['id']}", file=sys.stderr)
+    try:
+        for c in chats:
+            try:
+                r = api.call("PATCH", f"conversation/{c['id']}", {"is_visible": False})
+                if not r.get("success"):
+                    raise RuntimeError(f"unexpected response: {r}")
+            except AuthError:
+                raise
+            except Exception as e:
+                failed.append(c)
+                print(f"failed {c['id']}: {e}", file=sys.stderr)
+                if not continue_on_error:
+                    break
+            else:
+                deleted.append(c)
+                print(f"deleted {c['id']}", file=sys.stderr)
+    finally:
+        print(f"deleted {len(deleted)}, failed {len(failed)}, skipped {len(chats) - len(deleted) - len(failed)}", file=sys.stderr)
     return deleted, failed
 
 
@@ -275,18 +281,25 @@ def main(argv=None):
             return 2
         if a.interactive:
             chats = pick(chats)
+            if not chats:
+                print("no chats picked: nothing deleted", file=sys.stderr)
+                return 0
         if not a.yes:
             word = random.choice(WORDS)
             if ask(f"Delete {len(chats)} chats permanently? Type {word} to confirm: ") != word:
                 print("aborted: nothing deleted", file=sys.stderr)
                 return 1
 
-        deleted, failed = delete_all(api, chats, a.continue_on_error)
-    except AuthError as e:
+        _, failed = delete_all(api, chats, a.continue_on_error)
+        return 1 if failed else 0
+    except (KeyboardInterrupt, EOFError):
+        print("\naborted", file=sys.stderr)
+        return 1
+    except Exception as e:
+        if a.verbose:
+            raise
         print(f"error: {e}", file=sys.stderr)
         return 2
-    print(f"deleted {len(deleted)}, failed {len(failed)}, skipped {len(chats) - len(deleted) - len(failed)}", file=sys.stderr)
-    return 1 if failed else 0
 
 
 if __name__ == "__main__":

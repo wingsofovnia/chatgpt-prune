@@ -107,6 +107,23 @@ class Filters(unittest.TestCase):
         self.assertFalse(any(p.startswith("gizmos/") for _, p in api.calls))
 
 
+class Resp(io.BytesIO):
+    status = 200
+
+
+class Errors(unittest.TestCase):
+    def test_retries_timeouts(self):
+        with mock.patch("urllib.request.urlopen", side_effect=[TimeoutError(), Resp(b'{"ok": 1}')]):
+            self.assertEqual(m.Api("x", delay=0, retry_delay=0).call("GET", "me"), {"ok": 1})
+
+    def test_main_exits_2_on_api_error(self):
+        broken = mock.Mock(call=mock.Mock(side_effect=RuntimeError("HTTP Error 403")))
+        err = io.StringIO()
+        with mock.patch.object(m, "Api", return_value=broken), redirect_stderr(err):
+            self.assertEqual(m.main(["--authorization", "x", "--dry-run"]), 2)
+        self.assertIn("error: HTTP Error 403", err.getvalue())
+
+
 class Delete(unittest.TestCase):
     chats = [chat(i, i) for i in ("c1", "c2", "c3")]
 
@@ -120,6 +137,15 @@ class Delete(unittest.TestCase):
 
     def test_continue_on_error(self):
         self.assertEqual(self.run_delete(continue_on_error=True), (["c1", "c3"], ["c2"]))
+
+    def test_summary_after_auth_error(self):
+        class Expired(FakeApi):
+            def call(self, method, path, body=None):
+                raise m.AuthError("HTTP 401")
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(m.AuthError):
+            m.delete_all(Expired(), self.chats)
+        self.assertIn("deleted 0, failed 0, skipped 3", err.getvalue())
 
     def test_sends_soft_delete_patch(self):
         api = FakeApi()
