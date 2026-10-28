@@ -8,8 +8,10 @@
 Delete is permanent. Run with --dry-run first.
 """
 import argparse
+import base64
 import heapq
 import json
+import logging
 import os
 import random
 import sys
@@ -24,6 +26,7 @@ BASE = "https://chatgpt.com/backend-api"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 PAGE = 28  # Larger pages get HTTP 429 fast.
 WORDS = ["REMOVE", "ERASE", "PURGE", "DISCARD", "DELETE"]
+log = logging.getLogger("chatgpt_chats_bulk_remove")
 FIELDS = ["id", "title", "create_time", "update_time", "pinned_time", "is_archived", "gizmo_id", "project"]
 
 
@@ -58,15 +61,20 @@ def is_plain_date(s):
         return False
 
 
-class Api:
-    def __init__(self, auth, delay=1.0, retries=3, retry_delay=2.0, verbose=False):
-        self.auth = f"Bearer {auth}"
-        self.delay, self.retries, self.retry_delay, self.verbose = delay, retries, retry_delay, verbose
-        self.last = 0.0
+def token_expiry(token):
+    """Return the token's exp time, or None. Reads the JWT payload. Does not verify it."""
+    try:
+        p = token.split(".")[1]
+        return datetime.fromtimestamp(json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4)))["exp"], timezone.utc)
+    except Exception:
+        return None
 
-    def _log(self, method, url, status):
-        if self.verbose:
-            print(f"{method} {url} -> {status}  [Authorization: Bearer ****]", file=sys.stderr)
+
+class Api:
+    def __init__(self, auth, delay=1.0, retries=3, retry_delay=2.0):
+        self.auth = f"Bearer {auth}"
+        self.delay, self.retries, self.retry_delay = delay, retries, retry_delay
+        self.last = 0.0
 
     def call(self, method, path, body=None):
         url = f"{BASE}/{path}"
@@ -77,10 +85,11 @@ class Api:
             self.last = time.monotonic()
             try:
                 with urllib.request.urlopen(urllib.request.Request(url, data, headers, method=method), timeout=30) as r:
-                    self._log(method, url, r.status)
-                    return json.load(r)
+                    body = json.load(r)
+                log.debug("%s %s -> %s (%.0f ms)", method, path, r.status, (time.monotonic() - self.last) * 1000)
+                return body
             except urllib.error.HTTPError as e:
-                self._log(method, url, e.code)
+                log.debug("%s %s -> %s", method, path, e.code)
                 if e.code == 401:
                     raise AuthError("HTTP 401: token is expired or not valid. Get a new token.") from None
                 if (e.code != 429 and e.code < 500) or attempt == self.retries:
@@ -88,10 +97,11 @@ class Api:
                 retry_after = e.headers.get("Retry-After") or ""
                 wait = float(retry_after) if retry_after.isdigit() else self.retry_delay * 2**attempt
             except OSError as e:  # URLError, timeouts, connection resets
-                self._log(method, url, getattr(e, "reason", e))
+                log.debug("%s %s -> %s", method, path, getattr(e, "reason", e))
                 if attempt == self.retries:
                     raise
                 wait = self.retry_delay * 2**attempt
+            log.debug("retry %d/%d in %.1fs", attempt + 1, self.retries, wait)
             time.sleep(wait)
 
 
@@ -136,12 +146,15 @@ def list_chats(api, a):
         sources.append(paged_offset(api, "true"))
     # The main list does not include all project chats. Read each project too.
     projects = {} if a.exclude_project_chats else list_projects(api)
-    for pid, name in projects.items():
-        if not a.project_name or name in a.project_name:
-            sources.append(paged_cursor(api, f"gizmos/{pid}/conversations", cursor=0))
+    wanted = {pid: name for pid, name in projects.items() if not a.project_name or name in a.project_name}
+    log.debug("sources: main list%s, %d of %d projects %s", "" if a.exclude_archived else ", archive",
+              len(wanted), len(projects), sorted(wanted.values()))
+    for pid in wanted:
+        sources.append(paged_cursor(api, f"gizmos/{pid}/conversations", cursor=0))
     seen = set()
     for c in heapq.merge(*sources, key=updated, reverse=True):
         if a.update_time_from and updated(c) < a.update_time_from:
+            log.debug("stop reading: next chat is older than --update-time-from")
             return  # All next chats are older.
         if c["id"] not in seen:
             seen.add(c["id"])
@@ -154,9 +167,10 @@ def find_chats(api, a):
 
     Stop reading pages after --limit chats to delete. stopped is True if older chats exist that are not checked.
     """
-    to_delete, excluded = [], []
+    to_delete, excluded, read, stopped = [], [], 0, False
     chats = list_chats(api, a)
     for c in chats:
+        read += 1
         if not selected(c, a):
             continue
         reason = excluded_by(c, a)
@@ -166,10 +180,13 @@ def find_chats(api, a):
         to_delete.append(c)
         if len(to_delete) == a.limit:
             try:
-                return to_delete, excluded, next(chats, None) is not None
+                stopped = next(chats, None) is not None
             except Exception:  # The list is complete. A failed peek must not abort the run.
-                return to_delete, excluded, True
-    return to_delete, excluded, False
+                stopped = True
+            break
+    log.debug("checked %d chats: %d to delete, %d excluded%s", read, len(to_delete), len(excluded),
+              ", stopped at --limit" if stopped else "")
+    return to_delete, excluded, stopped
 
 
 def selected(c, a):
@@ -297,7 +314,7 @@ def parse_args(argv):
     g.add_argument("--yes", **flag, help="skip the typed confirmation")
     g = p.add_argument_group("output")
     g.add_argument("--output", choices=["table", "json", "ids"], default="table")
-    g.add_argument("--verbose", **flag, help="log each request to stderr, token masked")
+    g.add_argument("--verbose", **flag, help="debug log to stderr: requests, retries, token expiry, sources. Traceback on errors.")
     g = p.add_argument_group("execution")
     g.add_argument("--delay", type=parse_duration, default=1.0, help="min time between requests, e.g. 500ms, 1s (default 1s)")
     g.add_argument("--retries", type=int, default=3, help="retries on 429, 5xx and network errors")
@@ -320,7 +337,13 @@ def parse_args(argv):
 
 def main(argv=None):
     a = parse_args(argv)
-    api = Api(a.authorization, a.delay, a.retries, a.retry_delay, a.verbose)
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.WARNING, stream=sys.stderr,
+                        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S", force=True)
+    exp = token_expiry(a.authorization)
+    if exp and exp < datetime.now(timezone.utc):
+        log.warning("token expired at %s. Get a new token.", exp.isoformat(timespec="minutes"))
+    log.debug("token expires %s", exp.isoformat(timespec="minutes") if exp else "unknown (not a JWT)")
+    api = Api(a.authorization, a.delay, a.retries, a.retry_delay)
     try:
         chats, excluded, stopped = find_chats(api, a)
 

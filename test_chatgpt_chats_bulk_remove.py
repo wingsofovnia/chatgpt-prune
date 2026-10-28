@@ -1,4 +1,5 @@
 """Tests with a fake API. No network. Run: python3 -m unittest -v"""
+import base64
 import io
 import os
 import unittest
@@ -196,6 +197,18 @@ class Errors(unittest.TestCase):
     def test_retries_timeouts(self):
         with mock.patch("urllib.request.urlopen", side_effect=[TimeoutError(), Resp(b'{"ok": 1}')]):
             self.assertEqual(m.Api("x", delay=0, retry_delay=0).call("GET", "me"), {"ok": 1})
+
+    def test_logs_retry(self):
+        with mock.patch("urllib.request.urlopen", side_effect=[TimeoutError(), Resp(b"{}")]), \
+                self.assertLogs(m.log, "DEBUG") as logs:
+            m.Api("x", delay=0, retry_delay=0).call("GET", "me")
+        self.assertTrue(any("retry 1/3 in 0.0s" in line for line in logs.output))
+        self.assertTrue(any("GET me -> 200" in line for line in logs.output))
+
+    def test_token_expiry(self):
+        payload = base64.urlsafe_b64encode(b'{"exp": 0}').decode().rstrip("=")
+        self.assertEqual(m.token_expiry(f"h.{payload}.s"), datetime(1970, 1, 1, tzinfo=timezone.utc))
+        self.assertIsNone(m.token_expiry("not-a-jwt"))
 
     def test_main_exits_2_on_api_error(self):
         broken = mock.Mock(call=mock.Mock(side_effect=RuntimeError("HTTP Error 403")))
