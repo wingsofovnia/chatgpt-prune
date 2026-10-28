@@ -138,16 +138,19 @@ def keep(c, a):
     updated = parse_date(c.get("update_time") or c["create_time"])
     title = (c.get("title") or "").lower()
     project = c.get("project")
+    in_project = (c.get("gizmo_id") or "").startswith("g-p-")
     return all([
         a.create_time_from is None or created >= a.create_time_from,
         a.create_time_to is None or created <= a.create_time_to,
         a.update_time_from is None or updated >= a.update_time_from,
         a.update_time_to is None or updated <= a.update_time_to,
         not (a.exclude_pinned and c.get("pinned_time")),
-        not (a.exclude_project_chats and (c.get("gizmo_id") or "").startswith("g-p-")),
+        not (a.exclude_project_chats and in_project),
         a.archived == "include" or bool(c.get("is_archived")) == (a.archived == "only"),
         not a.project_name or project in a.project_name,
         project not in a.exclude_project_name,
+        # A project with no known name (e.g. shared) can be an excluded one. Keep its chats.
+        not (a.exclude_project_name and in_project and project is None),
         not a.title_contains or any(t.lower() in title for t in a.title_contains),
         not any(t.lower() in title for t in a.exclude_title_contains),
     ])

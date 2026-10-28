@@ -95,6 +95,12 @@ class Filters(unittest.TestCase):
         self.assertEqual(select("--create-time-to", "2025-05-01"), ["r1"])
         self.assertEqual(select("--create-time-from", "2026-01-10T10:00:00.000001Z"), [])
 
+    def test_exclude_project_name_keeps_unknown_projects(self):
+        shared = chat("s1", "Shared", gizmo_id="g-p-shared")
+        a = args("--exclude-project-name", "Work")
+        self.assertFalse(m.keep({**shared, "project": None}, a))
+        self.assertTrue(m.keep({**shared, "project": None}, args()))
+
     def test_exclude_project_chats_skips_project_requests(self):
         api = FakeApi()
         m.list_chats(api, args("--exclude-project-chats"))

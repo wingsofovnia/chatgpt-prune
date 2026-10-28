@@ -45,6 +45,7 @@ Run `./chatgpt_chats_bulk_remove.py --help` for all flags.
 - The script reads the main list, the archive, and each project. The main list does not include all project chats.
 - Dates are ISO (`2026-10-29` or `2026-10-29T09:03:50.719809Z`). No zone means UTC. A plain date in a `-to` flag includes that whole day.
 - `--title-contains` and `--project-name` can repeat. A chat matches if any value matches.
+- With `--exclude-project-name`, the script keeps chats of projects it cannot name (for example, shared projects). It reads names of your own projects only.
 - `--limit` keeps the most recently updated chats.
 - Requests run one at a time. Defaults avoid rate limits: 1s between requests, 3 retries on 429/5xx. Retries honor `Retry-After`.
 - Exit code: 0 = OK, 1 = some deletes failed or you aborted, 2 = auth or usage error.
