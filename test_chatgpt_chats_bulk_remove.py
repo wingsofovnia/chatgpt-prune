@@ -150,12 +150,12 @@ class EarlyStop(unittest.TestCase):
     def test_limit_reads_only_needed_pages(self):
         api = PagedApi()
         self.assertEqual([c["id"] for c in m.find_chats(api, args("--limit", "3"))[0]], ["c0", "c1", "c2"])
-        self.assertFalse(any("offset=28" in p for _, p in api.calls))
+        self.assertFalse(any(f"offset={m.PAGE}" in p for _, p in api.calls))
 
     def test_update_time_from_stops_paging(self):
         api = PagedApi()
         self.assertEqual(len(m.find_chats(api, args("--update-time-from", "2026-09-10"))[0]), 22)
-        self.assertFalse(any("offset=28" in p for _, p in api.calls))
+        self.assertFalse(any(f"offset={m.PAGE}" in p for _, p in api.calls))
 
     def test_merges_sources_newest_first(self):
         times = [m.updated(c) for c in m.find_chats(FakeApi(), args())[0]]

@@ -69,7 +69,7 @@ The tests use a fake API. They make no network calls.
 
 The script uses these endpoints under `https://chatgpt.com/backend-api`. They are not official and can change.
 
-- `GET conversations?offset=N&limit=28&order=updated&is_archived=false|true`: list chats.
+- `GET conversations?offset=N&limit=100&order=updated&is_archived=false|true`: list chats.
 - `GET gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=0`: list projects.
 - `GET gizmos/{project_id}/conversations?cursor=…`: list the chats of a project. The main list does not include all of them.
 - `PATCH conversation/{id}` with `{"is_visible": false}`: delete a chat. This is the same call as the ChatGPT UI.

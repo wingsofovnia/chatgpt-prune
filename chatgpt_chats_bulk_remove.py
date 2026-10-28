@@ -24,7 +24,7 @@ from datetime import date, datetime, timedelta, timezone
 BASE = "https://chatgpt.com/backend-api"
 # Cloudflare returns 403 without a browser User-Agent.
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-PAGE = 28  # Larger pages get HTTP 429 fast.
+PAGE = 100  # API maximum: larger values get HTTP 422.
 WORDS = ["REMOVE", "ERASE", "PURGE", "DISCARD", "DELETE"]
 log = logging.getLogger("chatgpt_chats_bulk_remove")
 FIELDS = ["id", "title", "create_time", "update_time", "pinned_time", "is_archived", "gizmo_id", "project"]
