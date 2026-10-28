@@ -229,7 +229,7 @@ def parse_args(argv):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     flag = dict(action="store_true")
-    p.add_argument("--authorization", help="plain JWT (eyJ...), no 'Bearer '. Default: env OPENAI_API_KEY. The env is safer: argv shows in ps and shell history.")
+    p.add_argument("--authorization", help="plain JWT (eyJ...), no 'Bearer '. Default: env CHATGPT_ACCESS_TOKEN. The env is safer: argv shows in ps and shell history.")
     g = p.add_argument_group("time filters (ISO date or datetime, UTC if no zone; a plain date in -to includes that day)")
     g.add_argument("--create-time-from", type=parse_date)
     g.add_argument("--create-time-to", type=lambda s: parse_date(s, end=True))
@@ -265,9 +265,9 @@ def parse_args(argv):
         p.error("--limit must be 1 or more")
     if min(a.retries, a.delay, a.retry_delay) < 0:
         p.error("--retries, --delay and --retry-delay must be 0 or more")
-    a.authorization = a.authorization or os.environ.get("OPENAI_API_KEY")
+    a.authorization = a.authorization or os.environ.get("CHATGPT_ACCESS_TOKEN")
     if not a.authorization:
-        p.error("give --authorization or set OPENAI_API_KEY")
+        p.error("give --authorization or set CHATGPT_ACCESS_TOKEN")
     if a.authorization.lower().startswith("bearer "):
         p.error("give the plain JWT, without 'Bearer '")
     return a

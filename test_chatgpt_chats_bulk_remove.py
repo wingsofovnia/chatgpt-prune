@@ -70,7 +70,7 @@ class Parsing(unittest.TestCase):
         self.assertFalse(args().exclude_pinned)
 
     def test_token_source(self):
-        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "env"}):
+        with mock.patch.dict(os.environ, {"CHATGPT_ACCESS_TOKEN": "env"}):
             self.assertEqual(m.parse_args(["--authorization", "flag"]).authorization, "flag")
             self.assertEqual(m.parse_args([]).authorization, "env")
         with mock.patch.dict(os.environ, {}, clear=True), redirect_stderr(io.StringIO()):

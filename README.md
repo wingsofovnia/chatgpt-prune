@@ -18,10 +18,10 @@ Bulk delete ChatGPT chats from the command line. One Python file. No dependencie
    This copies the token to the clipboard. Paste it with Cmd+V (Ctrl+V on Linux and Windows) or `pbpaste`. The console prints `undefined`. That is normal.
 3. Export the token (plain JWT, no `Bearer `):
    ```sh
-   export OPENAI_API_KEY="$(pbpaste)"
+   export CHATGPT_ACCESS_TOKEN="$(pbpaste)"
    ```
 
-`--authorization` wins over `OPENAI_API_KEY`. Prefer the env var: `ps` and shell history show command-line args.
+`--authorization` wins over `CHATGPT_ACCESS_TOKEN`. The script does not read `OPENAI_API_KEY`: that name usually holds an OpenAI platform key (`sk-...`), which does not work here. Prefer the env var: `ps` and shell history show command-line args.
 
 The token gives full access to your account. Do not share it. The server can reject a token before its `exp` time. If you get HTTP 401, get a new token.
 
