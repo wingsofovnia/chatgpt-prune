@@ -44,6 +44,7 @@ The token gives full access to your account. Do not share it. If you get HTTP 40
 Run `--help` for all flags. Important behavior:
 
 - Dates are ISO (`2026-10-29` or `2026-10-29T09:03:50Z`). No zone means UTC. A plain date in a `-to` flag includes that whole day.
+- `--limit` takes the N most recently updated matches. The script stops reading pages after it has them. `--update-time-from` stops reading at the first older chat.
 - With `--exclude-project-name`, chats in projects you do not own (for example, shared projects) are never deleted. The script cannot read those project names, so it cannot check them against the exclude list.
 - Requests run one at a time, 1s apart. The script retries on 429 and 5xx.
 - Exit code: 0 = OK, 1 = some deletes failed or you aborted, 2 = auth, API, network or usage error.

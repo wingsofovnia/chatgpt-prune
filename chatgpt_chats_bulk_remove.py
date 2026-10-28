@@ -8,6 +8,7 @@
 Delete is permanent. Run with --dry-run first.
 """
 import argparse
+import heapq
 import json
 import os
 import random
@@ -16,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from itertools import islice
 from datetime import date, datetime, timedelta, timezone
 
 BASE = "https://chatgpt.com/backend-api"
@@ -120,39 +122,50 @@ def list_projects(api):
     return {i["gizmo"]["gizmo"]["id"]: i["gizmo"]["gizmo"]["display"]["name"] for i in items}
 
 
+def updated(c):
+    return parse_date(c.get("update_time") or c["create_time"])
+
+
 def list_chats(api, a):
-    """Collect chats from the main list, the archive and each project. Remove duplicates by id."""
-    chats = {}
+    """Yield chats from the main list, the archive and each project. Newest update first, no duplicates.
 
-    def add(items):
-        for c in items:
-            chats.setdefault(c["id"], c)
-
+    Pages are read only when needed. Each source is newest first, so a merge keeps that order.
+    """
+    sources = []
     if a.archived != "only":
-        add(paged_offset(api, "false"))
+        sources.append(paged_offset(api, "false"))
     if a.archived != "exclude":
-        add(paged_offset(api, "true"))
+        sources.append(paged_offset(api, "true"))
     # The main list does not include all project chats. Read each project too.
     projects = {} if a.exclude_project_chats else list_projects(api)
     for pid, name in projects.items():
         if (not a.project_name or name in a.project_name) and name not in a.exclude_project_name:
-            add(paged_cursor(api, f"gizmos/{pid}/conversations", cursor=0))
-    for c in chats.values():
-        c["project"] = projects.get(c.get("gizmo_id"))
-    return list(chats.values())
+            sources.append(paged_cursor(api, f"gizmos/{pid}/conversations", cursor=0))
+    seen = set()
+    for c in heapq.merge(*sources, key=updated, reverse=True):
+        if a.update_time_from and updated(c) < a.update_time_from:
+            return  # All next chats are older.
+        if c["id"] not in seen:
+            seen.add(c["id"])
+            c["project"] = projects.get(c.get("gizmo_id"))
+            yield c
+
+
+def find_chats(api, a):
+    """Return the first --limit matches, newest update first. Stop reading pages after that."""
+    return list(islice((c for c in list_chats(api, a) if keep(c, a)), a.limit))
 
 
 def keep(c, a):
     created = parse_date(c["create_time"])
-    updated = parse_date(c.get("update_time") or c["create_time"])
     title = (c.get("title") or "").lower()
     project = c.get("project")
     in_project = (c.get("gizmo_id") or "").startswith("g-p-")
     return all([
         a.create_time_from is None or created >= a.create_time_from,
         a.create_time_to is None or created <= a.create_time_to,
-        a.update_time_from is None or updated >= a.update_time_from,
-        a.update_time_to is None or updated <= a.update_time_to,
+        a.update_time_from is None or updated(c) >= a.update_time_from,
+        a.update_time_to is None or updated(c) <= a.update_time_to,
         not (a.exclude_pinned and c.get("pinned_time")),
         not (a.exclude_project_chats and in_project),
         a.archived == "include" or bool(c.get("is_archived")) == (a.archived == "only"),
@@ -277,9 +290,7 @@ def main(argv=None):
     a = parse_args(argv)
     api = Api(a.authorization, a.delay, a.retries, a.retry_delay, a.verbose)
     try:
-        chats = [c for c in list_chats(api, a) if keep(c, a)]
-        chats.sort(key=lambda c: c.get("update_time") or "", reverse=True)
-        chats = chats[: a.limit]
+        chats = find_chats(api, a)
 
         print(render(chats, a.output))
         print(f"{len(chats)} chats match", file=sys.stderr)

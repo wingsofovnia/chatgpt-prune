@@ -3,7 +3,7 @@ import io
 import os
 import unittest
 from contextlib import redirect_stderr
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import chatgpt_chats_bulk_remove as m
@@ -110,8 +110,37 @@ class Filters(unittest.TestCase):
 
     def test_exclude_project_chats_skips_project_requests(self):
         api = FakeApi()
-        m.list_chats(api, args("--exclude-project-chats"))
+        list(m.list_chats(api, args("--exclude-project-chats")))
         self.assertFalse(any(p.startswith("gizmos/") for _, p in api.calls))
+
+
+class PagedApi(FakeApi):
+    """Main list: 2 full pages, chat c<i> updated i days before 2026-10-01. No archive, no projects."""
+
+    def call(self, method, path, body=None):
+        self.calls.append((method, path))
+        if "is_archived=false" in path:
+            start = int(path.split("offset=")[1].split("&")[0])
+            day0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
+            return {"items": [chat(f"c{i}", f"c{i}", updated=(day0 - timedelta(days=i)).isoformat())
+                              for i in range(start, min(start + m.PAGE, 2 * m.PAGE))]}
+        return {"items": [], "cursor": None}
+
+
+class EarlyStop(unittest.TestCase):
+    def test_limit_reads_only_needed_pages(self):
+        api = PagedApi()
+        self.assertEqual([c["id"] for c in m.find_chats(api, args("--limit", "3"))], ["c0", "c1", "c2"])
+        self.assertFalse(any("offset=28" in p for _, p in api.calls))
+
+    def test_update_time_from_stops_paging(self):
+        api = PagedApi()
+        self.assertEqual(len(m.find_chats(api, args("--update-time-from", "2026-09-10"))), 22)
+        self.assertFalse(any("offset=28" in p for _, p in api.calls))
+
+    def test_merges_sources_newest_first(self):
+        times = [m.updated(c) for c in m.find_chats(FakeApi(), args())]
+        self.assertEqual(times, sorted(times, reverse=True))
 
 
 class Resp(io.BytesIO):
