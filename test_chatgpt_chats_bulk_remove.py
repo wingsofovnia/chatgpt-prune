@@ -54,9 +54,16 @@ class Parsing(unittest.TestCase):
         self.assertEqual(m.parse_date("2026-10-29"), datetime(2026, 10, 29, tzinfo=utc))
         self.assertEqual(m.parse_date("2026-10-29", end=True), datetime(2026, 10, 29, 23, 59, 59, 999999, tzinfo=utc))
         self.assertEqual(m.parse_date("2026-10-29T09:03:50.719809Z"), datetime(2026, 10, 29, 9, 3, 50, 719809, tzinfo=utc))
+        self.assertEqual(m.parse_date("20261029", end=True), datetime(2026, 10, 29, 23, 59, 59, 999999, tzinfo=utc))
+        self.assertEqual(m.parse_date("2026-10-29T00:00:00", end=True), datetime(2026, 10, 29, tzinfo=utc))
 
     def test_durations(self):
         self.assertEqual([m.parse_duration(s) for s in ("500ms", "2s", "1m", "1.5")], [0.5, 2.0, 60.0, 1.5])
+
+    def test_rejects_negative_execution_values(self):
+        for flag in ("--retries=-1", "--delay=-1s", "--retry-delay=-1"):
+            with redirect_stderr(io.StringIO()):
+                self.assertRaises(SystemExit, args, flag)
 
     def test_bool_flags(self):
         self.assertTrue(args("--exclude-pinned").exclude_pinned)

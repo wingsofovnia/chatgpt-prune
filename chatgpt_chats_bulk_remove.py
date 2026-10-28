@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 BASE = "https://chatgpt.com/backend-api"
 # Cloudflare returns 403 without a browser User-Agent.
@@ -43,9 +43,18 @@ def parse_date(s, end=False):
     dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    if end and len(s) == 10:
+    if end and is_plain_date(s):
         dt += timedelta(days=1, microseconds=-1)
     return dt
+
+
+def is_plain_date(s):
+    """True for a date with no time: '2026-10-29', '20261029'."""
+    try:
+        date.fromisoformat(s)
+        return True
+    except ValueError:
+        return False
 
 
 class Api:
@@ -254,6 +263,8 @@ def parse_args(argv):
         p.error("--project-name and --exclude-project-chats conflict")
     if a.limit is not None and a.limit < 1:
         p.error("--limit must be 1 or more")
+    if min(a.retries, a.delay, a.retry_delay) < 0:
+        p.error("--retries, --delay and --retry-delay must be 0 or more")
     a.authorization = a.authorization or os.environ.get("OPENAI_API_KEY")
     if not a.authorization:
         p.error("give --authorization or set OPENAI_API_KEY")
