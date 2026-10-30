@@ -8,6 +8,7 @@ import base64
 import io
 import os
 import unittest
+import urllib.error
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -145,6 +146,52 @@ class Filters(unittest.TestCase):
         m.find_chats(api, args("--exclude-archived", "--exclude-project-chats"))
         self.assertFalse(any("is_archived=true" in p or p.startswith("gizmos/") for _, p in api.calls))
 
+    def test_project_name_skips_main_list(self):
+        archived = chat("r2", "Archived project chat", created="2025-04-01T00:00:00Z", is_archived=True, gizmo_id="g-p-1")
+
+        class Api(FakeApi):
+            def call(self, method, path, body=None):
+                if "is_archived=true" in path:
+                    self.calls.append((method, path))
+                    return {"items": page(path, ARCHIVED + [archived])}
+                if path.startswith("gizmos/g-p-1/conversations"):  # Items without gizmo_id: tagged by the source.
+                    self.calls.append((method, path))
+                    return {"cursor": None, "items": [{**c, "gizmo_id": None} for c in PROJECT]}
+                return super().call(method, path, body)
+        api = Api()
+        self.assertEqual([c["id"] for c in m.find_chats(api, args("--project-name", "Work"))[0]], ["p1", "p2", "r2"])
+        self.assertFalse(any("is_archived=false" in p for _, p in api.calls))
+
+    def test_each_project_tags_its_own_chats(self):
+        class Api(FakeApi):
+            def call(self, method, path, body=None):
+                if path.startswith("gizmos/snorlax/sidebar"):
+                    return {"cursor": None, "items": [{"gizmo": {"gizmo": {"id": g, "display": {"name": n}}}}
+                                                      for g, n in (("g-p-1", "Work"), ("g-p-2", "Home"))]}
+                if path.startswith("gizmos/g-p-"):  # Items without gizmo_id: the source must tag them.
+                    g = path.split("/")[1]
+                    return {"cursor": None, "items": [chat(f"{g}-c", "x", gizmo_id=None)]}
+                return super().call(method, path, body)
+        got = {c["id"]: c["project"] for c in m.list_chats(Api(), args("--exclude-archived"))}
+        self.assertEqual((got["g-p-1-c"], got["g-p-2-c"]), ("Work", "Home"))
+
+    def test_exclude_archived_also_from_project_lists(self):
+        archived = {**PROJECT[1], "is_archived": True}
+
+        class Api(FakeApi):
+            def call(self, method, path, body=None):
+                if path.startswith("gizmos/g-p-1/conversations"):
+                    return {"cursor": None, "items": [PROJECT[0], archived]}
+                return super().call(method, path, body)
+        to_delete, excluded, _ = m.find_chats(Api(), args("--project-name", "Work", "--exclude-archived"))
+        self.assertEqual(([c["id"] for c in to_delete], {c["id"]: r for c, r in excluded}), (["p1"], {"p2": "archived"}))
+
+    def test_unknown_project_name_fails(self):
+        for flag in ("--project-name", "--exclude-project-name"):
+            with self.assertRaisesRegex(RuntimeError, "unknown project 'Wrok'. Your projects: 'Work'"):
+                m.find_chats(FakeApi(), args(flag, "Wrok"))
+        m.find_chats(FakeApi(), args("--exclude-project-chats", "--exclude-project-name", "Wrok"))  # Projects not read.
+
     def test_selection_drops_are_not_listed(self):
         self.assertEqual(excluded("--project-name", "Work", "--updated-before", "2026-01-01"), {})
 
@@ -207,8 +254,11 @@ class EarlyStop(unittest.TestCase):
         self.assertEqual(times, sorted(times, reverse=True))
 
     def test_limit_counts_only_chats_to_delete(self):
+        # Same update time everywhere: project chats p1, p2 come first, then a1, the excluded a2, then r1.
         to_delete, out, stopped = m.find_chats(FakeApi(), args("--exclude-pinned", "--limit", "3"))
-        self.assertEqual((len(to_delete), [c["id"] for c, _ in out], stopped), (3, ["a2"], True))
+        self.assertEqual(([c["id"] for c in to_delete], out, stopped), (["p1", "p2", "a1"], [], True))
+        to_delete, out, stopped = m.find_chats(FakeApi(), args("--exclude-pinned", "--limit", "4"))
+        self.assertEqual(([c["id"] for c in to_delete], [c["id"] for c, _ in out]), (["p1", "p2", "a1", "r1"], ["a2"]))
 
     def test_not_stopped_when_all_read(self):
         self.assertFalse(m.find_chats(FakeApi(), args("--limit", "99"))[2])
@@ -312,6 +362,41 @@ class Errors(unittest.TestCase):
         self.assertTrue(any("retry 1/4 in 0.0s" in line for line in logs.output))
         self.assertTrue(any("GET me -> 200" in line for line in logs.output))
 
+    def test_403_retried(self):
+        def forbidden(headers, body=b"<html>Just a moment...</html>"):
+            return urllib.error.HTTPError("u", 403, "Forbidden", headers, io.BytesIO(body))
+        api = m.Api("x", delay=0, retry_delay=0)
+        with mock.patch("urllib.request.urlopen", side_effect=[forbidden({"Content-Type": "text/html"}), Resp(b'{"ok": 1}')]), \
+                self.assertLogs(m.log, "DEBUG") as logs:
+            self.assertEqual(api.call("GET", "me"), {"ok": 1})
+        self.assertTrue(any("403 text/html <html>Just a moment" in line for line in logs.output))
+        too_many = lambda: urllib.error.HTTPError("u", 429, "Too Many", {}, io.BytesIO(b""))
+        with mock.patch("urllib.request.urlopen", side_effect=[too_many(), too_many(), forbidden({}), forbidden({}),
+                                                               forbidden({})]), \
+                mock.patch("time.sleep"), self.assertLogs(m.log, "DEBUG") as logs:
+            self.assertRaises(urllib.error.HTTPError, m.Api("x", delay=0, retry_delay=0).call, "GET", "me")
+        self.assertTrue(any("retry 4/4" in line for line in logs.output))
+        server = lambda: urllib.error.HTTPError("u", 500, "Error", {}, io.BytesIO(b""))
+        with mock.patch("urllib.request.urlopen", side_effect=[server(), server(), server(), server(), forbidden({})]), \
+                mock.patch("time.sleep"), self.assertLogs(m.log, "DEBUG"):  # Last attempt raises, never returns None.
+            self.assertRaises(urllib.error.HTTPError, m.Api("x", delay=0, retry_delay=0).call, "GET", "me")
+        challenge = forbidden({"cf-mitigated": "challenge"})
+        with mock.patch("urllib.request.urlopen", side_effect=[challenge]), mock.patch("time.sleep"), \
+                self.assertLogs(m.log, "DEBUG"):
+            self.assertRaisesRegex(m.StopRun, "Cloudflare challenge", api.call, "GET", "me")
+
+    def test_pacing_per_method_and_backoff(self):
+        api, slept = m.Api("x", delay=1, retry_delay=10), []
+        api.on_wait = lambda text, seconds: slept.append(("backoff", seconds))
+        too_many = lambda: urllib.error.HTTPError("u", 429, "Too Many", {}, io.BytesIO(b""))
+        with mock.patch("urllib.request.urlopen", side_effect=[Resp(b"{}"), Resp(b"{}"), too_many(), too_many(), Resp(b"{}")]), \
+                mock.patch("time.monotonic", return_value=100.0), mock.patch("time.sleep", lambda s: slept.append(s)), \
+                self.assertLogs(m.log, "DEBUG"):
+            api.call("GET", "a")  # First read: no wait.
+            api.call("PATCH", "b")  # First delete: no wait, the read before does not count.
+            api.call("GET", "c")  # Second read: --delay, then 2 retries with 10s, 20s.
+        self.assertEqual(slept, [1.0, ("backoff", 10.0), 1.0, ("backoff", 20.0), 1.0])
+
     def test_countdown_shows_time_left(self):
         shown = []
         with mock.patch("time.sleep"), mock.patch("time.monotonic", side_effect=[0, 0, 1, 2]):
@@ -359,11 +444,18 @@ class Delete(unittest.TestCase):
     def test_summary_after_auth_error(self):
         class Expired(FakeApi):
             def call(self, method, path, body=None):
-                raise m.AuthError("HTTP 401")
+                raise m.StopRun("HTTP 401")
         err = io.StringIO()
-        with redirect_stderr(err), self.assertRaises(m.AuthError):
+        with redirect_stderr(err), self.assertRaises(m.StopRun):
             m.delete_all(Expired(), self.chats)
         self.assertIn("deleted 0 · ✖ failed 0 · skipped 3", err.getvalue())
+
+    def test_cloudflare_challenge_stops_continue_on_error(self):
+        class Challenged(FakeApi):
+            def call(self, method, path, body=None):
+                raise m.StopRun("HTTP 403: Cloudflare challenge")
+        with redirect_stderr(io.StringIO()), self.assertRaises(m.StopRun):
+            m.delete_all(Challenged(), self.chats, continue_on_error=True)
 
     def test_sends_soft_delete_patch(self):
         api = FakeApi()

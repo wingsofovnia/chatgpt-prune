@@ -57,8 +57,9 @@ Important behavior:
 
 - Dates are ISO (`2026-10-29` or `2026-10-29T09:03:50Z`). No zone means UTC. A plain date means 00:00. `--updated-before` excludes that moment, `--updated-after` includes it. There is no create-time filter: the API fails on `order=created` (HTTP 500).
 - `--limit` caps the chats to delete, newest first. The script reads only the pages it needs. `--updated-after` stops reading at the first older chat, `--updated-before` skips newer ones.
-- With `--exclude-project-name`, chats in projects you do not own (for example, shared projects) are never deleted. The script cannot read those project names, so it cannot check them against the exclude list.
-- Requests run one at a time, 500ms apart (`--delay`). The script retries on 429 and 5xx.
+- With `--project-name`, the script reads only those projects and the archive, not the main list.
+- With `--exclude-project-name`, chats in projects you do not own (for example, shared projects) are never deleted. The script cannot read those project names, so it cannot check them against the exclude list. A `--project-name` or `--exclude-project-name` that is not one of your projects stops the script, so a typo cannot delete the project you meant to keep.
+- Requests run one at a time. Reads are `--delay` apart (default 1s), and deletes too. Faster bursts get HTTP 403. On 403, 429, 5xx or a network error, the script waits `--retry-delay` (default 10s), doubles it each time, and tries up to `--retries` times (default 4). A Cloudflare challenge (HTTP 403 with `cf-mitigated: challenge`) stops the run: open chatgpt.com in the browser, then run again.
 - Exit code: 0 = OK, 1 = some deletes failed or you aborted, 2 = auth, API, network or usage error.
 
 ## Tests

@@ -53,8 +53,8 @@ for name in ("clock", "runner"):
 FIELDS = ["id", "title", "create_time", "update_time", "pinned_time", "is_archived", "gizmo_id", "project"]
 
 
-class AuthError(Exception):
-    pass
+class StopRun(Exception):
+    """Every next request fails too (bad token, Cloudflare challenge). Stop, even with --continue-on-error."""
 
 
 def parse_duration(s):
@@ -91,42 +91,50 @@ def countdown(show, text, seconds):
 class Api:
     on_wait_default = staticmethod(lambda text, seconds: time.sleep(seconds))
 
-    def __init__(self, auth, delay=0.5, retries=4, retry_delay=10.0):
+    def __init__(self, auth, delay=1.0, retries=4, retry_delay=10.0):
         self.auth = f"Bearer {auth}"
         self.delay, self.retries, self.retry_delay = delay, retries, retry_delay
-        self.last = 0.0
+        self.last = {}  # method -> time of its last request. Reads (GET) and deletes (PATCH) are paced apart.
         self.requests = self.retried = 0  # For the summary line.
         self.on_wait = Api.on_wait_default  # The UI replaces it to show a countdown.
 
     def call(self, method, path, body=None):
+        """--delay between requests of the same method, none before the first. On an error, retry_delay * 2^attempt."""
         url = f"{BASE}/{path}"
         data = None if body is None else json.dumps(body).encode()
         headers = {"Authorization": self.auth, "User-Agent": UA, "Accept": "application/json", "Content-Type": "application/json"}
         for attempt in range(self.retries + 1):
             self.requests += 1
-            time.sleep(max(0.0, self.last + self.delay - time.monotonic()))
-            self.last = time.monotonic()
+            if method in self.last:
+                time.sleep(max(0.0, self.last[method] + self.delay - time.monotonic()))
+            started = self.last[method] = time.monotonic()
             try:
                 with urllib.request.urlopen(urllib.request.Request(url, data, headers, method=method), timeout=30) as r:
                     body = json.load(r)
-                log.debug("%s %s -> %s (%.0f ms)", method, path, r.status, (time.monotonic() - self.last) * 1000)
+                log.debug("%s %s -> %s (%.0f ms)", method, path, r.status, (time.monotonic() - started) * 1000)
                 return body
             except urllib.error.HTTPError as e:
-                log.debug("%s %s -> %s", method, path, e.code)
+                with e:  # Close the response, also when retried.
+                    if log.isEnabledFor(logging.DEBUG):
+                        try:
+                            text = " ".join(e.read(300).decode("utf-8", "replace").split())
+                        except Exception:  # Diagnostics only: a broken body must not hide the HTTP error.
+                            text = ""
+                        log.debug("%s %s -> %s %s %s", method, path, e.code, e.headers.get("Content-Type") or "", text)
                 if e.code == 401:
-                    raise AuthError("HTTP 401: token is expired or not valid. Get a new token.") from None
-                if (e.code != 429 and e.code < 500) or attempt == self.retries:
+                    raise StopRun("HTTP 401: token is expired or not valid. Get a new token.") from None
+                if e.code == 403 and e.headers.get("cf-mitigated") == "challenge":  # Does not clear on retry.
+                    raise StopRun("HTTP 403: Cloudflare challenge. Open chatgpt.com in the browser, then retry.") from None
+                # Request bursts get a short 403 (seen 2026-10). GET and the delete PATCH are safe to repeat.
+                if e.code not in (403, 429) and e.code < 500 or attempt == self.retries:
                     raise
-                why = "rate limited (HTTP 429)" if e.code == 429 else f"HTTP {e.code}"
-                # ChatGPT sends no Retry-After today (checked 2026-10). Kept in case Cloudflare or the API add it.
-                retry_after = e.headers.get("Retry-After") or ""
-                wait = float(retry_after) if retry_after.isdigit() else self.retry_delay * 2**attempt
+                why = {403: "blocked (HTTP 403)", 429: "rate limited (HTTP 429)"}.get(e.code, f"HTTP {e.code}")
             except OSError as e:  # URLError, timeouts, connection resets
                 log.debug("%s %s -> %s", method, path, getattr(e, "reason", e))
-                why = f"network error ({getattr(e, 'reason', e)})"
                 if attempt == self.retries:
                     raise
-                wait = self.retry_delay * 2**attempt
+                why = f"network error ({getattr(e, 'reason', e)})"
+            wait = self.retry_delay * 2**attempt
             log.debug("%s, retry %d/%d in %.1fs", why, attempt + 1, self.retries, wait)
             self.retried += 1
             self.on_wait(f"{why[0].upper()}{why[1:]}, retry {attempt + 1}/{self.retries}", wait)
@@ -210,23 +218,42 @@ def updated(c):
     return parse_date(c.get("update_time") or c["create_time"])
 
 
+def project_chats(api, pid):
+    """Chats of one project, by update time. Tagged with pid: every chat in this list belongs to it."""
+    for c in paged_cursor(api, f"gizmos/{pid}/conversations", cursor=0):
+        yield {**c, "gizmo_id": pid}
+
+
 def list_chats(api, a):
-    """Yield chats from the main list, the archive and each project. Newest first by update time, no duplicates.
+    """Yield chats from each project, the main list (not with --project-name) and the archive.
+
+    Newest first by update time, no duplicates.
 
     Pages are read only when needed. Each source is newest first, so a merge keeps that order.
     With --updated-before, the main list and the archive skip ahead to it.
     """
     # Excluded sources are not read: nothing from them can be deleted.
-    sources = [paged_offset(api, "false", a.updated_before)]
-    if not a.exclude_archived:
-        sources.append(paged_offset(api, "true", a.updated_before))
+    # With --project-name, the project lists have the chats. Archived project chats may be only in the archive.
     # The main list does not include all project chats. Read each project too.
     projects = {} if a.exclude_project_chats else list_projects(api)
     wanted = {pid: name for pid, name in projects.items() if not a.project_name or name in a.project_name}
-    log.debug("sources: main list%s, %d of %d projects %s", "" if a.exclude_archived else ", archive",
-              len(wanted), len(projects), sorted(wanted.values()))
-    for pid in wanted:
-        sources.append(paged_cursor(api, f"gizmos/{pid}/conversations", cursor=0))  # By update time.
+    # A typo in --exclude-project-name would delete the project it meant to keep. Projects not read: nothing to check.
+    names = set(a.project_name) | (set() if a.exclude_project_chats else set(a.exclude_project_name))
+    if unknown := sorted(names - set(projects.values())):
+        hint = (" Shared projects cannot be named: use --exclude-project-chats to keep all project chats."
+                if set(unknown) & set(a.exclude_project_name) else "")
+        raise RuntimeError(f"unknown project {', '.join(map(repr, unknown))}. Your projects: "
+                           f"{', '.join(map(repr, sorted(projects.values())))}.{hint}")
+    # Project lists first: on a tie the merge keeps the first source's copy, and that copy has the project.
+    sources, lists = [project_chats(api, pid) for pid in wanted], []
+    if not a.project_name:
+        sources.append(paged_offset(api, "false", a.updated_before))
+        lists.append("main list")
+    if not a.exclude_archived:
+        sources.append(paged_offset(api, "true", a.updated_before))
+        lists.append("archive")
+    log.debug("sources: %s, %d of %d projects %s", ", ".join(lists) or "no lists", len(wanted), len(projects),
+              sorted(wanted.values()))
     seen = set()
     # The merge keeps each source's order, so one check on its output catches any unsorted source.
     for c in ordered(heapq.merge(*sources, key=updated, reverse=True), a):
@@ -258,7 +285,7 @@ def find_chats(api, a, progress=lambda read, to_delete, excluded: None):
         if len(to_delete) == a.limit:
             try:
                 stopped = next(chats, None) is not None
-            except OSError:  # Network error: the list is complete, so do not abort. A sort error must still fail.
+            except OSError:  # The list is complete, so do not abort. A sort error or StopRun must still fail.
                 stopped = True
             break
     log.debug("checked %d chats: %d to delete, %d excluded%s", read, len(to_delete), len(excluded),
@@ -284,6 +311,9 @@ def excluded_by(c, a):
     in_project = (c.get("gizmo_id") or "").startswith("g-p-")
     if a.exclude_pinned and c.get("pinned_time"):
         return "pinned"
+    # The archive list is not read, but a project list can still return an archived chat.
+    if a.exclude_archived and c.get("is_archived"):
+        return "archived"
     if a.exclude_project_chats and in_project:
         return "project chat"
     if project in a.exclude_project_name:
@@ -437,7 +467,7 @@ def delete_all(api, chats, continue_on_error=False):
                     r = api.call("PATCH", f"conversation/{c['id']}", {"is_visible": False})
                     if not r.get("success"):
                         raise RuntimeError(f"unexpected response: {r}")
-                except AuthError:
+                except StopRun:
                     raise
                 except Exception as e:
                     failed.append(c)
@@ -483,8 +513,9 @@ def parse_args(argv):
     g.add_argument("--output", choices=["table", "json", "ids"], default="table")
     g.add_argument("--verbose", **flag, help="debug log to stderr: requests, retries, token expiry, sources. Traceback on errors.")
     g = p.add_argument_group("execution")
-    g.add_argument("--delay", type=parse_duration, default=0.5, help="min time between requests, e.g. 500ms, 2s (default 500ms)")
-    g.add_argument("--retries", type=int, default=4, help="retries on 429, 5xx and network errors (default 4)")
+    g.add_argument("--delay", type=parse_duration, default=1.0, help="min time between requests of the same kind (reads, deletes), e.g. 500ms, 2s (default 1s). "
+                        "Below 1s, Cloudflare can block with HTTP 403.")
+    g.add_argument("--retries", type=int, default=4, help="retries on 403, 429, 5xx and network errors (default 4). A Cloudflare challenge stops the run.")
     g.add_argument("--retry-delay", type=parse_duration, default=10.0, help="first retry wait, doubles each time (default 10s)")
     g.add_argument("--continue-on-error", **flag)
     a = p.parse_args(argv)
@@ -546,6 +577,9 @@ def main(argv=None):
             err.print(table(cs, f"🛡  Excluded, not deleted ({len(excluded)})", rs, color="yellow", width=err.width))
         if a.exclude_archived:
             err.print("[dim]Archive not read (--exclude-archived).[/]")
+        if a.project_name:
+            err.print("[dim]Main list not read (--project-name). Only the lists of those projects are read"
+                      f"{'' if a.exclude_archived else ', and the archive'}.[/]")
         if a.exclude_project_chats:
             err.print("[dim]Project chat lists not read (--exclude-project-chats). Only project chats in the main list are shown.[/]")
         err.print()  # Blank line between the excluded and the to-delete lists.
