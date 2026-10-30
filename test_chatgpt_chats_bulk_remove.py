@@ -247,19 +247,20 @@ class EarlyStop(unittest.TestCase):
     def test_dry_run_output(self):
         out, err = self.dry_run("--exclude-pinned", "--exclude-title-contains", "only")
         self.assertIn("Reason", err)
-        self.assertRegex(err, r"a2 .* pinned .* Pinned chat")
-        self.assertRegex(err, r"p2 .* title has 'only' .* Project only")
+        self.assertRegex(err, r"Pinned chat .* pinned")
+        self.assertRegex(err, r"Project only .* title has 'only'")
         self.assertIn("3 to delete · 2 excluded", err)
         self.assertIn("Read 5 chats", err)
         self.assertIn("To delete (3)", out)
         self.assertNotIn("Reason", out)
-        self.assertNotIn("a2", out)
+        self.assertNotIn("Pinned chat", out)
 
-    def test_table_keeps_ids_and_raw_titles_at_80_columns(self):
+    def test_table_has_raw_titles_and_no_ids_at_80_columns(self):
         buf = io.StringIO()
         c = chat("6720a1b2-0000-8000-aaaa-123456789abc", "Fix :x: bug " + "long " * 20)
         Console(file=buf, width=80, emoji=False).print(m.table([c], "t", width=80))
-        self.assertIn("6720a1b2-0000-8000-aaaa-123456789abc", buf.getvalue())
+        self.assertNotIn("6720a1b2", buf.getvalue())
+        self.assertRegex(buf.getvalue(), r"│ Title +│ Created")
         self.assertIn("Fix :x: bug", buf.getvalue())
 
     def test_table_hides_empty_columns_and_counts_reasons(self):
@@ -280,8 +281,23 @@ class EarlyStop(unittest.TestCase):
                  pinned_time="2026-01-01T00:00:00Z", project="Work")
         Console(file=buf, width=80, emoji=False).print(m.table([c], "t", ["title has 'рецепт'"], width=80))
         self.assertIn("Перевод", buf.getvalue())
-        self.assertIn("6720a1b2-0000-8000-aaaa-123456789abc", buf.getvalue())
+        self.assertIn("title has 'рецепт'", buf.getvalue())
         self.assertTrue(all(len(line) <= 80 for line in buf.getvalue().splitlines()))
+
+    def test_chat_title_is_one_clean_line(self):
+        self.assertEqual(m.chat_title(chat("e", " \n")), "(no title)")
+        self.assertEqual(m.chat_title(chat("t", "a\x1b[31m\u200db\nc")), "a [31m\u200db c")  # ZWJ stays.
+        self.assertEqual(m.clean("a\ud83db\u202ec\u2066"), "abc")
+        buf = io.StringIO()
+        c = chat("p", "t", gizmo_id="g-p-1", project="Wo\x1b]0;x\x07rk\nX")
+        Console(file=buf, width=120).print(m.table([c], "t", width=120))
+        self.assertNotIn("\x1b]", buf.getvalue())
+        self.assertIn("Wo ]0;x rk X", buf.getvalue())
+
+    def test_wide_title_is_not_cut(self):
+        buf = io.StringIO()
+        Console(file=buf, width=120).print(m.table([chat("w", "中文标题测试一下")], "t", width=120))
+        self.assertIn("中文标题测试一下", buf.getvalue())
 
     def test_backslash_title_keeps_link(self):
         buf = io.StringIO()
@@ -289,11 +305,11 @@ class EarlyStop(unittest.TestCase):
         self.assertIn("trail\\\\\\", buf.getvalue())
         self.assertNotIn("[/link]", buf.getvalue())
 
-    def test_ids_and_titles_link_to_chat(self):
+    def test_titles_link_to_chat(self):
         buf = io.StringIO()
         c = chat("6720a1b2-0000-8000-aaaa-123456789abc", "Hello", gizmo_id="g-p-1", project="Work")
         Console(file=buf, width=200, force_terminal=True).print(m.table([c], "t", width=200))
-        self.assertEqual(buf.getvalue().count("https://chatgpt.com/c/6720a1b2-0000-8000-aaaa-123456789abc"), 2)
+        self.assertEqual(buf.getvalue().count("https://chatgpt.com/c/6720a1b2-0000-8000-aaaa-123456789abc"), 1)
         self.assertIn("https://chatgpt.com/g/g-p-1/project", buf.getvalue())
 
     def test_dry_run_reports_limit_stop(self):
@@ -340,12 +356,12 @@ class Errors(unittest.TestCase):
 class Pick(unittest.TestCase):
     def test_enter_keeps_and_writes_n_after_wrapped_prompt(self):
         out = io.StringIO()
-        chats = [chat("a1", "party :smile: time"), chat("a2", "x")]
+        chats = [chat("a1", "中文 party time"), chat("a2", "x")]  # CJK chars are 2 terminal cells wide.
         with mock.patch.object(m, "err", Console(file=out, width=40, force_terminal=True)), \
                 mock.patch.object(m, "ask", side_effect=["", "y"]):
             self.assertEqual([c["id"] for c in m.pick(chats)], ["a2"])
-        # Prompt wraps after 'time'?, last line '[y/N/a/q] ' is 10 cells: N goes to column 11.
-        self.assertEqual(out.getvalue(), "\x1b[1A\x1b[11GN\x1b[1E")
+        # Prompt wraps after 'time', last line '(2026-01-10)? [y/N/a/q] ' is 24 cells: N goes to column 25.
+        self.assertEqual(out.getvalue(), "\x1b[1A\x1b[25GN\x1b[1E")
 
 
 class Delete(unittest.TestCase):

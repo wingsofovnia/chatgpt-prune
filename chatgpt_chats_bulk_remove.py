@@ -16,6 +16,7 @@ import os
 import random
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +24,7 @@ from collections import Counter
 from datetime import datetime, timezone
 
 from rich import box
+from rich.cells import cell_len
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.markup import escape
@@ -41,7 +43,7 @@ WORDS = ["REMOVE", "ERASE", "PURGE", "DISCARD", "DELETE"]
 log = logging.getLogger("chatgpt_chats_bulk_remove")
 # UI (spinner, logs, excluded table, prompts) goes to stderr.
 # stdout gets only the list to delete, so `> file` or a pipe captures just that.
-# Not a terminal (file, pipe): rich falls back to 80 columns and cuts IDs. Use a wide width there.
+# Not a terminal (file, pipe): rich falls back to 80 columns and cuts titles. Use a wide width there.
 # emoji=False: a title with ':x:' must show as typed, not as an emoji.
 err = Console(stderr=True, emoji=False, width=None if sys.stderr.isatty() else 250)
 out = Console(emoji=False, width=None if sys.stdout.isatty() else 250)
@@ -312,12 +314,11 @@ def table(chats, title, reasons=None, color="red", width=250):
 
     Project, Pinned (📌) and Archived (📦) are hidden when no row has a value.
     Column widths are set here, so rich does not shrink columns. If the table does not fit in width,
-    Created, Project, Updated, Archived and Pinned are hidden in that order. ID, Reason and Title always stay.
-    Below about 70 columns nothing fits, and rich cuts the table.
+    Created, Project, Updated, Archived and Pinned are hidden in that order. Title and Reason always stay.
+    No ID column: the title links to the chat. --output ids and json give the IDs.
     """
-    titles = {c["id"]: " ".join((c.get("title") or "").split()) for c in chats}  # Line breaks would split a row.
-    project_w = min(20, max((len(c.get("project") or "") for c in chats), default=0))
-    cols = [("ID", 36), ("Created", 10), ("Updated", 10)]  # (name, width). Never cut: the ID is what you check.
+    project_w = min(20, max((cell_len(clean(c.get("project") or "")) for c in chats), default=0))
+    cols = [("Created", 10), ("Updated", 10)]  # (name, width)
     if any(c.get("pinned_time") for c in chats):
         cols.append(("Pinned", 6))
     if any(c.get("is_archived") for c in chats):
@@ -325,7 +326,7 @@ def table(chats, title, reasons=None, color="red", width=250):
     if project_w:
         cols.append(("Project", max(project_w, 7)))
     if reasons:
-        cols.append(("Reason", min(20, max(6, *map(len, reasons)))))
+        cols.append(("Reason", min(20, max(6, *map(cell_len, reasons)))))
     border = lambda n: 3 * n + 1  # Each column adds 2 padding + 1 border line.
     for drop in ("Created", "Project", "Updated", "Archived", "Pinned"):
         if sum(w for _, w in cols) + border(len(cols) + 1) + 20 <= width:
@@ -336,19 +337,16 @@ def table(chats, title, reasons=None, color="red", width=250):
         r_w = dict(cols)["Reason"]
         cols = [(n, max(8, r_w - (20 - free)) if n == "Reason" else w) for n, w in cols]
         free = width - sum(w for _, w in cols) - border(len(cols) + 1)
-    cols.append(("Title", max(12, min(free, max(map(len, titles.values()), default=5)))))
+    cols.insert(0, ("Title", max(12, min(free, max((cell_len(chat_title(c)) for c in chats), default=5)))))
 
-    # Text cells, not markup: a title like 'a\\\\' or '[/]' must not break the link tags.
-    link = lambda text, url: Text(text, style=f"link {url}")
     cell = {
-        "ID": lambda c, r: link(c["id"], f"{WEB}/c/{c['id']}"),
         "Created": lambda c, r: c["create_time"][:10],
-        "Updated": lambda c, r: (c.get("update_time") or "")[:10],
+        "Updated": lambda c, r: updated_day(c),
         "Pinned": lambda c, r: "📌" if c.get("pinned_time") else "",
         "Archived": lambda c, r: "📦" if c.get("is_archived") else "",
         "Project": lambda c, r: link(c["project"], f"{WEB}/g/{c['gizmo_id']}/project") if c.get("project") else "",
         "Reason": lambda c, r: Text(r),
-        "Title": lambda c, r: link(titles[c["id"]], f"{WEB}/c/{c['id']}"),
+        "Title": lambda c, r: chat_link(c),
     }
     # Title and Reason wrap inside their width. All other columns keep one line.
     options = {"Project": {"no_wrap": True, "overflow": "ellipsis"}, "Reason": {"style": "yellow"}, "Title": {},
@@ -363,8 +361,39 @@ def table(chats, title, reasons=None, color="red", width=250):
     return t
 
 
+def clean(text):
+    """One line: line breaks would split a table row or a prompt. Control chars (ESC) would reach the terminal.
+
+    Lone surrogates (Cs) crash the stdout encoder. Bidi overrides would reorder the prompt after the title.
+    Other Cf stays: ZWJ joins emoji, ZWNJ shapes Persian.
+    """
+    def keep(ch):
+        cat = unicodedata.category(ch)
+        return " " if cat == "Cc" else "" if cat == "Cs" or "\u202a" <= ch <= "\u202e" or "\u2066" <= ch <= "\u2069" else ch
+    return " ".join("".join(map(keep, text)).split())
+
+
+def link(text, url):
+    """Text, not markup: a title like 'a\\\\' or '[/]' must not break the link tags."""
+    return Text(clean(text), style=f"link {url}")
+
+
+def chat_title(c):
+    """Empty: a placeholder, so the link has text."""
+    return clean(c.get("title") or "") or "(no title)"
+
+
+def chat_link(c):
+    return link(chat_title(c), f"{WEB}/c/{c['id']}")
+
+
+def updated_day(c):
+    """String slice, not parse_date: a display string must never raise."""
+    return (c.get("update_time") or c["create_time"])[:10]
+
+
 def ask(prompt):
-    """prompt is rich markup. Shown on stderr, so `> file` gets only the list."""
+    """prompt is rich markup or Text. Shown on stderr, so `> file` gets only the list."""
     return err.input(prompt, emoji=False).strip()
 
 
@@ -372,12 +401,12 @@ def pick(chats):
     """Ask for each chat. y = delete, n = keep, a = delete this and all next, q = stop asking."""
     picked = []
     for i, c in enumerate(chats):
-        prompt = escape(f"[{i + 1}/{len(chats)}] delete {c['id']} {c.get('title')!r}? [y/N/a/q] ")
+        prompt = Text.assemble(f"[{i + 1}/{len(chats)}] Delete ", chat_link(c), f" ({updated_day(c)})? [y/N/a/q] ")
         ans = ask(prompt).lower()
         if not ans and err.is_terminal and not err.legacy_windows:
             # Enter leaves the answer blank in scrollback. Write N after the prompt: up 1 line, to its end, back down.
-            # Measure the last line as rich wrapped it (word wrap, emoji=False like ask), not by modulo.
-            last = Segment.get_line_length(err.render_lines(Text.from_markup(prompt, emoji=False), pad=False)[-1])
+            # Measure the last line as rich wrapped it (word wrap, wide chars), not by modulo.
+            last = Segment.get_line_length(err.render_lines(prompt, pad=False)[-1])
             if last < err.width:  # A full last line has no room for N.
                 err.file.write(f"\x1b[1A\x1b[{last + 1}GN\x1b[1E")
                 err.file.flush()
@@ -418,13 +447,13 @@ def delete_all(api, chats, continue_on_error=False):
                 except Exception as e:
                     failed.append(c)
                     done()
-                    err.print(Text.assemble(("✖ failed ", "red"), f"{c['id']}: {e}"))
+                    err.print(Text.assemble(("✖ failed ", "red"), chat_link(c), f" ({c['id']}): {e}"))
                     if not continue_on_error:
                         break
                 else:
                     deleted.append(c)
                     done()
-                    err.print(Text.assemble(("✔ ", "green"), f"deleted {c['id']}  ", (c.get("title") or "", "dim")))
+                    err.print(Text.assemble(("✔ ", "green"), "deleted ", chat_link(c), f" ({updated_day(c)})"))
     finally:
         api.on_wait = Api.on_wait_default
         err.print(f"[green]✔ deleted {len(deleted)}[/] · [red]✖ failed {len(failed)}[/] · "
