@@ -1,9 +1,9 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["rich>=13"]  # Keep in sync with chatgpt_chats_bulk_remove.py.
+# dependencies = ["rich>=13"]  # Keep in sync with chatgpt_prune.py.
 # ///
-"""Tests with a fake API. No network. Run: ./test_chatgpt_chats_bulk_remove.py -v"""
+"""Tests with a fake API. No network. Run: ./test_chatgpt_prune.py -v"""
 import base64
 import io
 import os
@@ -14,7 +14,7 @@ from unittest import mock
 
 from rich.console import Console
 
-import chatgpt_chats_bulk_remove as m
+import chatgpt_prune as m
 
 
 def chat(id, title, created="2026-01-10T10:00:00.000000Z", updated=None, **kw):
@@ -101,7 +101,7 @@ class Parsing(unittest.TestCase):
             with redirect_stderr(err):
                 self.assertRaises(SystemExit, m.parse_args, ["--authorization", " Bearer h.p.s"])
             self.assertIn("no 'Bearer '", err.getvalue())
-            self.assertRaises(SystemExit, m.parse_args, ["--authorization", "❯ ./chatgpt_chats_bulk_remove.py"])
+            self.assertRaises(SystemExit, m.parse_args, ["--authorization", "❯ ./chatgpt_prune.py"])
             self.assertRaises(SystemExit, m.parse_args, ["--authorization", "токен.x.y"])
         self.assertEqual(m.Api("eyJ").auth, "Bearer eyJ")
 

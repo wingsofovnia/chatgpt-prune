@@ -40,7 +40,7 @@ WEB = "https://chatgpt.com"  # Links in tables. /c/{id} also opens project chats
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 PAGE = 100  # API maximum: larger values get HTTP 422.
 WORDS = ["REMOVE", "ERASE", "PURGE", "DISCARD", "DELETE"]
-log = logging.getLogger("chatgpt_chats_bulk_remove")
+log = logging.getLogger("chatgpt_prune")
 # UI (spinner, logs, excluded table, prompts) goes to stderr.
 # stdout gets only the list to delete, so `> file` or a pipe captures just that.
 # Not a terminal (file, pipe): rich falls back to 80 columns and cuts titles. Use a wide width there.

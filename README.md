@@ -1,6 +1,6 @@
-# ChatGPT Chat Bulk Remover
+# chatgpt-prune
 
-Delete ChatGPT chats in bulk from the command line. Filter by date, project, title, pinned and archived state. One Python file.
+Bulk-delete ChatGPT chats from the terminal. Filter by date, project, title, pinned or archived. One Python file.
 
 **Delete is permanent.** You cannot restore a deleted chat. Run with `--dry-run` first.
 
@@ -17,7 +17,7 @@ Delete ChatGPT chats in bulk from the command line. Filter by date, project, tit
    ```
 3. Pass the token to the script:
    ```sh
-   ./chatgpt_chats_bulk_remove.py --authorization "$(pbpaste)" --dry-run
+   ./chatgpt_prune.py --authorization "$(pbpaste)" --dry-run
    ```
 
 As an alternative, set the token once per shell:
@@ -32,13 +32,13 @@ The token gives full access to your account. Do not share it. If you get HTTP 40
 
 ```sh
 # List chats last updated before July. Delete nothing.
-./chatgpt_chats_bulk_remove.py --updated-before=2026-07-01 --exclude-pinned --dry-run
+./chatgpt_prune.py --updated-before=2026-07-01 --exclude-pinned --dry-run
 
 # Delete them. The script lists the chats and asks you to type a confirmation word.
-./chatgpt_chats_bulk_remove.py --updated-before=2026-07-01 --exclude-pinned
+./chatgpt_prune.py --updated-before=2026-07-01 --exclude-pinned
 
 # Delete chats of one project. Ask for each chat.
-./chatgpt_chats_bulk_remove.py --project-name="Work" --interactive
+./chatgpt_prune.py --project-name="Work" --interactive
 ```
 
 Run `--help` for all flags.
@@ -60,7 +60,7 @@ Important behavior:
 ## Tests
 
 ```sh
-./test_chatgpt_chats_bulk_remove.py -v
+./test_chatgpt_prune.py -v
 ```
 
 The tests use a fake API. They make no network calls.
