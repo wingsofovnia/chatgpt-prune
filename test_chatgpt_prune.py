@@ -125,8 +125,8 @@ class Filters(unittest.TestCase):
 
     def test_title_and_time(self):
         self.assertEqual(select("--title-contains", "PROJECT", "--exclude-title-contains", "only"), ["p1"])
-        self.assertEqual(select("--created-before", "2025-05-02"), ["r1"])
-        self.assertEqual(select("--created-after", "2026-01-10T10:00:00.000001Z"), [])
+        self.assertEqual(select("--updated-before", "2025-05-02"), ["r1"])
+        self.assertEqual(select("--updated-after", "2026-01-10T10:00:00.000001Z"), [])
 
     def test_exclude_project_name_keeps_unknown_projects(self):
         shared = chat("s1", "Shared", gizmo_id="g-p-shared")
@@ -183,46 +183,24 @@ class EarlyStop(unittest.TestCase):
         self.assertFalse(any(f"offset={m.PAGE}" in p for _, p in api.calls))
 
     def test_before_skips_newer_pages(self):
-        for flag in ("--updated-before", "--created-before"):
-            api = PagedApi()
-            # c150 is 2026-05-04 00:00, the newest chat before the cutoff. c149 is 2026-05-05 00:00, not before it.
-            to_delete = m.find_chats(api, args(flag, "2026-05-05"))[0]
-            self.assertEqual([c["id"] for c in to_delete], [f"c{i}" for i in range(150, 200)], flag)
-            self.assertNotIn(("GET", "conversations?offset=0&limit=100&order=" + ("updated" if "update" in flag else "created")
-                              + "&is_archived=false"), api.calls, flag)
-
-    def test_create_time_uses_created_order(self):
         api = PagedApi()
-        m.find_chats(api, args("--created-after", "2026-09-01"))
-        self.assertTrue(all("order=created" in p for _, p in api.calls if p.startswith("conversations?")))
+        # c150 is 2026-05-04 00:00, the newest chat before the cutoff. c149 is 2026-05-05 00:00, not before it.
+        to_delete = m.find_chats(api, args("--updated-before", "2026-05-05"))[0]
+        self.assertEqual([c["id"] for c in to_delete], [f"c{i}" for i in range(150, 200)])
+        self.assertNotIn(("GET", "conversations?offset=0&limit=100&order=updated&is_archived=false"), api.calls)
 
     def test_unsorted_list_fails_when_order_matters(self):
         for swap in ((0, 1), (99, 100)):  # In one page, and across a page boundary.
-            with self.assertRaisesRegex(RuntimeError, "not sorted by updated time"):
+            with self.assertRaisesRegex(RuntimeError, "not sorted by update time"):
                 m.find_chats(PagedApi(swap), args("--updated-after", "2020-01-01"))
         m.find_chats(PagedApi((0, 1)), args())  # No time filter, no --limit: order does not matter.
         with self.assertRaisesRegex(RuntimeError, "not sorted"):  # Also when the bad chat is the --limit peek.
             m.find_chats(PagedApi((2, 3)), args("--limit", "3"))
 
-    def test_created_order_sorts_project_lists(self):
-        class Api(FakeApi):
-            def call(self, method, path, body=None):
-                if path.startswith("gizmos/g-p-1/conversations"):  # Newest update first, not newest create.
-                    return {"cursor": None, "items": [
-                        chat("q1", "old", created="2026-01-01T00:00:00Z", updated="2026-06-01T00:00:00Z", gizmo_id="g-p-1"),
-                        chat("q2", "new", created="2026-03-01T00:00:00Z", updated="2026-05-01T00:00:00Z", gizmo_id="g-p-1")]}
-                return super().call(method, path, body)
-        to_delete = m.find_chats(Api(), args("--created-after", "2026-02-01"))[0]
-        self.assertEqual([c["id"] for c in to_delete], ["q2"])
-
     def test_seek_reads_few_probes_on_small_lists(self):
         api = PagedApi()
         m.find_chats(api, args("--exclude-archived", "--updated-before", "2026-05-05"))
         self.assertEqual(sum("limit=1&" in p for _, p in api.calls), 2)  # Offsets 100 and 200.
-
-    def test_mixed_time_kinds_rejected(self):
-        with redirect_stderr(io.StringIO()):
-            self.assertRaises(SystemExit, args, "--created-before", "2026-01-01", "--updated-before", "2026-01-01")
 
     def test_merges_sources_newest_first(self):
         times = [m.updated(c) for c in m.find_chats(FakeApi(), args())[0]]

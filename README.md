@@ -45,14 +45,14 @@ Run `--help` for all flags.
 
 The script works in 3 stages:
 
-1. **Select** what to delete: `--created-before/after`, `--updated-before/after`, `--project-name`, `--title-contains`. Chats outside the selection are ignored: not deleted, not listed.
+1. **Select** what to delete: `--updated-before/after`, `--project-name`, `--title-contains`. Chats outside the selection are ignored: not deleted, not listed.
 2. **Filter** what to protect: the `--exclude-*` flags. The script lists excluded chats with the reason before the confirmation.
 3. **Delete.** The chats that pass both stages, after you confirm.
 
 Important behavior:
 
-- Dates are ISO (`2026-10-29` or `2026-10-29T09:03:50Z`). No zone means UTC. A plain date means 00:00. `--*-before` excludes that moment, `--*-after` includes it.
-- `--limit` caps the chats to delete, newest first. The script reads only the pages it needs. `--*-after` stops reading at the first older chat, `--*-before` skips newer ones. Create and update time filters cannot be mixed.
+- Dates are ISO (`2026-10-29` or `2026-10-29T09:03:50Z`). No zone means UTC. A plain date means 00:00. `--updated-before` excludes that moment, `--updated-after` includes it. There is no create-time filter: the API fails on `order=created` (HTTP 500).
+- `--limit` caps the chats to delete, newest first. The script reads only the pages it needs. `--updated-after` stops reading at the first older chat, `--updated-before` skips newer ones.
 - With `--exclude-project-name`, chats in projects you do not own (for example, shared projects) are never deleted. The script cannot read those project names, so it cannot check them against the exclude list.
 - Requests run one at a time, 500ms apart (`--delay`). The script retries on 429 and 5xx.
 - Exit code: 0 = OK, 1 = some deletes failed or you aborted, 2 = auth, API, network or usage error.
@@ -69,7 +69,7 @@ The tests use a fake API. They make no network calls.
 
 The script uses these endpoints under `https://chatgpt.com/backend-api`. They are not official and can change.
 
-- `GET conversations?offset=N&limit=100&order=updated|created&is_archived=false|true`: list chats. With `--*-before`, `limit=1` requests find the cutoff first.
+- `GET conversations?offset=N&limit=100&order=updated&is_archived=false|true`: list chats. With `--updated-before`, `limit=1` requests find the cutoff first.
 - `GET gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=0`: list projects.
 - `GET gizmos/{project_id}/conversations?cursor=…`: list the chats of a project. The main list does not include all of them.
 - `PATCH conversation/{id}` with `{"is_visible": false}`: delete a chat. This is the same call as the ChatGPT UI.
