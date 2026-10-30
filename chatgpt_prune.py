@@ -54,7 +54,7 @@ FIELDS = ["id", "title", "create_time", "update_time", "pinned_time", "is_archiv
 
 
 class StopRun(Exception):
-    """Every next request fails too (bad token, Cloudflare challenge). Stop, even with --continue-on-error."""
+    """Every next request fails too (bad token). Stop, even with --continue-on-error."""
 
 
 def parse_duration(s):
@@ -123,8 +123,6 @@ class Api:
                         log.debug("%s %s -> %s %s %s", method, path, e.code, e.headers.get("Content-Type") or "", text)
                 if e.code == 401:
                     raise StopRun("HTTP 401: token is expired or not valid. Get a new token.") from None
-                if e.code == 403 and e.headers.get("cf-mitigated") == "challenge":  # Does not clear on retry.
-                    raise StopRun("HTTP 403: Cloudflare challenge. Open chatgpt.com in the browser, then retry.") from None
                 # Request bursts get a short 403 (seen 2026-10). GET and the delete PATCH are safe to repeat.
                 if e.code not in (403, 429) and e.code < 500 or attempt == self.retries:
                     raise
@@ -218,12 +216,6 @@ def updated(c):
     return parse_date(c.get("update_time") or c["create_time"])
 
 
-def project_chats(api, pid):
-    """Chats of one project, by update time. Tagged with pid: every chat in this list belongs to it."""
-    for c in paged_cursor(api, f"gizmos/{pid}/conversations", cursor=0):
-        yield {**c, "gizmo_id": pid}
-
-
 def list_chats(api, a):
     """Yield chats from each project, the main list (not with --project-name) and the archive.
 
@@ -240,12 +232,9 @@ def list_chats(api, a):
     # A typo in --exclude-project-name would delete the project it meant to keep. Projects not read: nothing to check.
     names = set(a.project_name) | (set() if a.exclude_project_chats else set(a.exclude_project_name))
     if unknown := sorted(names - set(projects.values())):
-        hint = (" Shared projects cannot be named: use --exclude-project-chats to keep all project chats."
-                if set(unknown) & set(a.exclude_project_name) else "")
         raise RuntimeError(f"unknown project {', '.join(map(repr, unknown))}. Your projects: "
-                           f"{', '.join(map(repr, sorted(projects.values())))}.{hint}")
-    # Project lists first: on a tie the merge keeps the first source's copy, and that copy has the project.
-    sources, lists = [project_chats(api, pid) for pid in wanted], []
+                           f"{', '.join(map(repr, sorted(projects.values())))}")
+    sources, lists = [paged_cursor(api, f"gizmos/{pid}/conversations", cursor=0) for pid in wanted], []  # By update time.
     if not a.project_name:
         sources.append(paged_offset(api, "false", a.updated_before))
         lists.append("main list")
@@ -389,12 +378,11 @@ def table(chats, title, reasons=None, color="red", width=250):
 def clean(text):
     """One line: line breaks would split a table row or a prompt. Control chars (ESC) would reach the terminal.
 
-    Lone surrogates (Cs) crash the stdout encoder. Bidi overrides would reorder the prompt after the title.
-    Other Cf stays: ZWJ joins emoji, ZWNJ shapes Persian.
+    Lone surrogates (Cs) crash the stdout encoder. Cf stays: ZWJ joins emoji, ZWNJ shapes Persian.
     """
     def keep(ch):
         cat = unicodedata.category(ch)
-        return " " if cat == "Cc" else "" if cat == "Cs" or "\u202a" <= ch <= "\u202e" or "\u2066" <= ch <= "\u2069" else ch
+        return " " if cat == "Cc" else "" if cat == "Cs" else ch
     return " ".join("".join(map(keep, text)).split())
 
 
@@ -515,7 +503,7 @@ def parse_args(argv):
     g = p.add_argument_group("execution")
     g.add_argument("--delay", type=parse_duration, default=1.0, help="min time between requests of the same kind (reads, deletes), e.g. 500ms, 2s (default 1s). "
                         "Below 1s, Cloudflare can block with HTTP 403.")
-    g.add_argument("--retries", type=int, default=4, help="retries on 403, 429, 5xx and network errors (default 4). A Cloudflare challenge stops the run.")
+    g.add_argument("--retries", type=int, default=4, help="retries on 403, 429, 5xx and network errors (default 4)")
     g.add_argument("--retry-delay", type=parse_duration, default=10.0, help="first retry wait, doubles each time (default 10s)")
     g.add_argument("--continue-on-error", **flag)
     a = p.parse_args(argv)

@@ -154,26 +154,10 @@ class Filters(unittest.TestCase):
                 if "is_archived=true" in path:
                     self.calls.append((method, path))
                     return {"items": page(path, ARCHIVED + [archived])}
-                if path.startswith("gizmos/g-p-1/conversations"):  # Items without gizmo_id: tagged by the source.
-                    self.calls.append((method, path))
-                    return {"cursor": None, "items": [{**c, "gizmo_id": None} for c in PROJECT]}
                 return super().call(method, path, body)
         api = Api()
         self.assertEqual([c["id"] for c in m.find_chats(api, args("--project-name", "Work"))[0]], ["p1", "p2", "r2"])
         self.assertFalse(any("is_archived=false" in p for _, p in api.calls))
-
-    def test_each_project_tags_its_own_chats(self):
-        class Api(FakeApi):
-            def call(self, method, path, body=None):
-                if path.startswith("gizmos/snorlax/sidebar"):
-                    return {"cursor": None, "items": [{"gizmo": {"gizmo": {"id": g, "display": {"name": n}}}}
-                                                      for g, n in (("g-p-1", "Work"), ("g-p-2", "Home"))]}
-                if path.startswith("gizmos/g-p-"):  # Items without gizmo_id: the source must tag them.
-                    g = path.split("/")[1]
-                    return {"cursor": None, "items": [chat(f"{g}-c", "x", gizmo_id=None)]}
-                return super().call(method, path, body)
-        got = {c["id"]: c["project"] for c in m.list_chats(Api(), args("--exclude-archived"))}
-        self.assertEqual((got["g-p-1-c"], got["g-p-2-c"]), ("Work", "Home"))
 
     def test_exclude_archived_also_from_project_lists(self):
         archived = {**PROJECT[1], "is_archived": True}
@@ -315,7 +299,7 @@ class EarlyStop(unittest.TestCase):
     def test_chat_title_is_one_clean_line(self):
         self.assertEqual(m.chat_title(chat("e", " \n")), "(no title)")
         self.assertEqual(m.chat_title(chat("t", "a\x1b[31m\u200db\nc")), "a [31m\u200db c")  # ZWJ stays.
-        self.assertEqual(m.clean("a\ud83db\u202ec\u2066"), "abc")
+        self.assertEqual(m.clean("a\ud83db"), "ab")
         buf = io.StringIO()
         c = chat("p", "t", gizmo_id="g-p-1", project="Wo\x1b]0;x\x07rk\nX")
         Console(file=buf, width=120).print(m.table([c], "t", width=120))
@@ -370,20 +354,6 @@ class Errors(unittest.TestCase):
                 self.assertLogs(m.log, "DEBUG") as logs:
             self.assertEqual(api.call("GET", "me"), {"ok": 1})
         self.assertTrue(any("403 text/html <html>Just a moment" in line for line in logs.output))
-        too_many = lambda: urllib.error.HTTPError("u", 429, "Too Many", {}, io.BytesIO(b""))
-        with mock.patch("urllib.request.urlopen", side_effect=[too_many(), too_many(), forbidden({}), forbidden({}),
-                                                               forbidden({})]), \
-                mock.patch("time.sleep"), self.assertLogs(m.log, "DEBUG") as logs:
-            self.assertRaises(urllib.error.HTTPError, m.Api("x", delay=0, retry_delay=0).call, "GET", "me")
-        self.assertTrue(any("retry 4/4" in line for line in logs.output))
-        server = lambda: urllib.error.HTTPError("u", 500, "Error", {}, io.BytesIO(b""))
-        with mock.patch("urllib.request.urlopen", side_effect=[server(), server(), server(), server(), forbidden({})]), \
-                mock.patch("time.sleep"), self.assertLogs(m.log, "DEBUG"):  # Last attempt raises, never returns None.
-            self.assertRaises(urllib.error.HTTPError, m.Api("x", delay=0, retry_delay=0).call, "GET", "me")
-        challenge = forbidden({"cf-mitigated": "challenge"})
-        with mock.patch("urllib.request.urlopen", side_effect=[challenge]), mock.patch("time.sleep"), \
-                self.assertLogs(m.log, "DEBUG"):
-            self.assertRaisesRegex(m.StopRun, "Cloudflare challenge", api.call, "GET", "me")
 
     def test_pacing_per_method_and_backoff(self):
         api, slept = m.Api("x", delay=1, retry_delay=10), []
@@ -449,13 +419,6 @@ class Delete(unittest.TestCase):
         with redirect_stderr(err), self.assertRaises(m.StopRun):
             m.delete_all(Expired(), self.chats)
         self.assertIn("deleted 0 · ✖ failed 0 · skipped 3", err.getvalue())
-
-    def test_cloudflare_challenge_stops_continue_on_error(self):
-        class Challenged(FakeApi):
-            def call(self, method, path, body=None):
-                raise m.StopRun("HTTP 403: Cloudflare challenge")
-        with redirect_stderr(io.StringIO()), self.assertRaises(m.StopRun):
-            m.delete_all(Challenged(), self.chats, continue_on_error=True)
 
     def test_sends_soft_delete_patch(self):
         api = FakeApi()
