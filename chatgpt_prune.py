@@ -9,6 +9,7 @@ Delete is permanent. Run with --dry-run first.
 """
 import argparse
 import base64
+import getpass
 import heapq
 import json
 import logging
@@ -478,7 +479,8 @@ def parse_args(argv):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     flag = dict(action="store_true")
-    p.add_argument("--authorization", help="plain JWT (eyJ...), no 'Bearer '. Default: env CHATGPT_ACCESS_TOKEN. The env is safer: argv shows in ps and shell history.")
+    p.add_argument("--authorization", help="plain JWT (eyJ...), no 'Bearer '. Default: env CHATGPT_ACCESS_TOKEN, else a hidden prompt. "
+                        "Avoid this flag: argv shows in ps and shell history.")
     g = p.add_argument_group("time filters (ISO date or datetime, UTC if no zone; before excludes it, after includes it)")
     g.add_argument("--updated-before", type=parse_date)
     g.add_argument("--updated-after", type=parse_date)
@@ -514,8 +516,10 @@ def parse_args(argv):
     if min(a.retries, a.delay, a.retry_delay) < 0:
         p.error("--retries, --delay and --retry-delay must be 0 or more")
     a.authorization = (a.authorization or os.environ.get("CHATGPT_ACCESS_TOKEN") or "").strip()
+    if not a.authorization and sys.stdin.isatty():  # Hidden input: not in shell history, same on every OS.
+        a.authorization = getpass.getpass("Paste your access token (hidden): ").strip()
     if not a.authorization:
-        p.error("give --authorization or set CHATGPT_ACCESS_TOKEN")
+        p.error("no token: paste it when asked, set CHATGPT_ACCESS_TOKEN, or give --authorization")
     # Smoke test only. The server rejects a bad token. Non-ASCII would crash before any request.
     if not a.authorization.isascii() or " " in a.authorization or a.authorization.count(".") != 2:
         p.error("not a plain JWT (eyJ..., no 'Bearer '). Is the clipboard holding something else?")
