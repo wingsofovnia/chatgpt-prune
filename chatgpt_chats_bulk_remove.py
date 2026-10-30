@@ -88,7 +88,7 @@ def countdown(show, text, seconds):
 class Api:
     on_wait_default = staticmethod(lambda text, seconds: time.sleep(seconds))
 
-    def __init__(self, auth, delay=2.0, retries=4, retry_delay=10.0):
+    def __init__(self, auth, delay=0.5, retries=4, retry_delay=10.0):
         self.auth = f"Bearer {auth}"
         self.delay, self.retries, self.retry_delay = delay, retries, retry_delay
         self.last = 0.0
@@ -450,7 +450,7 @@ def parse_args(argv):
     g.add_argument("--output", choices=["table", "json", "ids"], default="table")
     g.add_argument("--verbose", **flag, help="debug log to stderr: requests, retries, token expiry, sources. Traceback on errors.")
     g = p.add_argument_group("execution")
-    g.add_argument("--delay", type=parse_duration, default=2.0, help="min time between requests, e.g. 500ms, 2s (default 2s)")
+    g.add_argument("--delay", type=parse_duration, default=0.5, help="min time between requests, e.g. 500ms, 2s (default 500ms)")
     g.add_argument("--retries", type=int, default=4, help="retries on 429, 5xx and network errors (default 4)")
     g.add_argument("--retry-delay", type=parse_duration, default=10.0, help="first retry wait, doubles each time (default 10s)")
     g.add_argument("--continue-on-error", **flag)

@@ -54,7 +54,7 @@ Important behavior:
 - Dates are ISO (`2026-10-29` or `2026-10-29T09:03:50Z`). No zone means UTC. A plain date means 00:00. `--*-before` excludes that moment, `--*-after` includes it.
 - `--limit` caps the chats to delete, newest first. The script reads only the pages it needs. `--*-after` stops reading at the first older chat, `--*-before` skips newer ones. Create and update time filters cannot be mixed.
 - With `--exclude-project-name`, chats in projects you do not own (for example, shared projects) are never deleted. The script cannot read those project names, so it cannot check them against the exclude list.
-- Requests run one at a time, 2s apart. The script retries on 429 and 5xx.
+- Requests run one at a time, 500ms apart (`--delay`). The script retries on 429 and 5xx.
 - Exit code: 0 = OK, 1 = some deletes failed or you aborted, 2 = auth, API, network or usage error.
 
 ## Tests
