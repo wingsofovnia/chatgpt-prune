@@ -28,6 +28,7 @@ from rich.logging import RichHandler
 from rich.markup import escape
 from rich.spinner import SPINNERS
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TaskProgressColumn, TextColumn, TimeRemainingColumn
+from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
@@ -371,7 +372,15 @@ def pick(chats):
     """Ask for each chat. y = delete, n = keep, a = delete this and all next, q = stop asking."""
     picked = []
     for i, c in enumerate(chats):
-        ans = ask(escape(f"[{i + 1}/{len(chats)}] delete {c['id']} {c.get('title')!r}? [y/N/a/q] ")).lower()
+        prompt = escape(f"[{i + 1}/{len(chats)}] delete {c['id']} {c.get('title')!r}? [y/N/a/q] ")
+        ans = ask(prompt).lower()
+        if not ans and err.is_terminal and not err.legacy_windows:
+            # Enter leaves the answer blank in scrollback. Write N after the prompt: up 1 line, to its end, back down.
+            # Measure the last line as rich wrapped it (word wrap, emoji=False like ask), not by modulo.
+            last = Segment.get_line_length(err.render_lines(Text.from_markup(prompt, emoji=False), pad=False)[-1])
+            if last < err.width:  # A full last line has no room for N.
+                err.file.write(f"\x1b[1A\x1b[{last + 1}GN\x1b[1E")
+                err.file.flush()
         if ans == "q":
             break
         if ans == "a":

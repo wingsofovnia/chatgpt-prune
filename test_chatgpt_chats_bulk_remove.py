@@ -337,6 +337,17 @@ class Errors(unittest.TestCase):
         self.assertIn("error: HTTP Error 403", err.getvalue())
 
 
+class Pick(unittest.TestCase):
+    def test_enter_keeps_and_writes_n_after_wrapped_prompt(self):
+        out = io.StringIO()
+        chats = [chat("a1", "party :smile: time"), chat("a2", "x")]
+        with mock.patch.object(m, "err", Console(file=out, width=40, force_terminal=True)), \
+                mock.patch.object(m, "ask", side_effect=["", "y"]):
+            self.assertEqual([c["id"] for c in m.pick(chats)], ["a2"])
+        # Prompt wraps after 'time'?, last line '[y/N/a/q] ' is 10 cells: N goes to column 11.
+        self.assertEqual(out.getvalue(), "\x1b[1A\x1b[11GN\x1b[1E")
+
+
 class Delete(unittest.TestCase):
     chats = [chat(i, i) for i in ("c1", "c2", "c3")]
 
